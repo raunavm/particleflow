@@ -6,7 +6,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from mlpf.data.colliderml.make_test_fixture import make_fixture
-from mlpf.data.colliderml.postprocessing import process_one_file
+from mlpf.data.colliderml.postprocessing import GEN_TARGET_ORDER, _gen_target_rows, process_one_file
 from mlpf.data.colliderml.reader import shard_paths
 from mlpf.data.colliderml.truth import DEFAULT_CALIBRATION, calibration_factors
 from mlpf.data.colliderml.v20_adapter import convert
@@ -221,3 +221,33 @@ def test_pandora_clusters(converted):
         np.testing.assert_allclose(xc[:, 5].sum(), e[lab >= 0].sum(), rtol=1e-5)
         h2c = np.asarray(out["pandora"]["hit_to_cluster"][i].as_py())
         assert ((h2c >= 0) == (lab >= 0)).all()
+
+
+def test_gen_target_identical_across_modes(converted):
+    _, _, out = converted
+    ref = out["clue"]["gen_target"].to_pylist()
+    assert sum(len(r) for r in ref) > 0
+    for algo in ("pandora", "identity"):
+        assert out[algo]["gen_target"].to_pylist() == ref
+        for k in ("genmet", "genjet", "X_track", "X_hit_calo", "X_hit_tracker", "event_id"):
+            assert out[algo][k].to_pylist() == out["clue"][k].to_pylist(), k
+
+
+def test_gen_target_rows():
+    gen = {
+        "PDG": np.array([111.0, -211.0, 2112.0]),
+        "charge": np.array([0.0, -1.0, 0.0]),
+        "pt": np.array([1.0, 2.0, 3.0]),
+        "eta": np.array([0.1, -0.2, 0.3]),
+        "phi": np.array([0.0, np.pi / 2, -np.pi / 2]),
+        "energy": np.array([4.0, 5.0, 6.0]),
+        "ispu": np.zeros(3),
+        "gp_to_track": np.array([0.0, 0.9, 0.0]),
+        "gp_to_cluster": np.array([1.0, 0.1, 1.0]),
+    }
+    rows = _gen_target_rows(gen)
+    assert rows.shape == (3, len(GEN_TARGET_ORDER)) and rows.dtype == np.float32
+    assert rows[:, 0].tolist() == [22, 211, 130]
+    np.testing.assert_allclose(rows[:, 4:6], [[0, 1], [1, 0], [-1, 0]], atol=1e-7)
+    np.testing.assert_allclose(rows[:, 8], gen["gp_to_track"])
+    assert _gen_target_rows({k: np.zeros(0) for k in gen}).shape == (0, len(GEN_TARGET_ORDER))

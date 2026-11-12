@@ -8,6 +8,7 @@
 #   genmet, genjet, targetjet, event_id
 #   genmet_withpu, genjet_withpu        (gen reference including pileup)
 #   pufrac_track, pufrac_cluster        (truth pileup fraction of every track / cluster)
+#   gen_target                          (visible truth particles before the allocator, GEN_TARGET_ORDER)
 # genmet/genjet are clustered from the hard-scatter part of the *measurable truth* set
 # (pre-visibility, pre-allocator, see truth.py genref_features), genmet_withpu/genjet_withpu from
 # all of it; targetjet from the ytarget representatives.
@@ -82,6 +83,25 @@ cluster_feature_order = EDM4HEP.ClusterFeatures.get_names()  # 17 names
 # EDM4hep hit layout used elsewhere in the codebase (X_hit already includes `type`), shared by
 # X_hit_calo (the raw calo hits we also cluster over) and X_hit_tracker (the raw tracker hits).
 _hit_feature_order = EDM4HEP.HitFeatures.get_names()  # 15 names
+# gen_target: the visible truth particles before the allocator. They do not depend on the clustering, so one
+# target list scores reconstructions with different elements. The class is the particle's own, not its element's.
+GEN_TARGET_ORDER = ["cls", "charge", "pt", "eta", "sin_phi", "cos_phi", "energy", "ispu", "gp_to_track", "gp_to_cluster"]
+
+
+def _gen_target_rows(gen_features) -> np.ndarray:
+    """gen_target rows in GEN_TARGET_ORDER, with pi0 counted as photon."""
+    pdg = np.abs(np.asarray(gen_features["PDG"], dtype=np.float64)).reshape(-1)
+    pdg[pdg == 111] = 22.0
+    out = np.zeros((len(pdg), len(GEN_TARGET_ORDER)), dtype=np.float32)
+    if len(pdg) == 0:
+        return out
+    charge = np.asarray(gen_features["charge"], dtype=np.float64).reshape(-1)
+    phi = np.asarray(gen_features["phi"], dtype=np.float64).reshape(-1)
+    feats = dict(gen_features, sin_phi=np.sin(phi), cos_phi=np.cos(phi))
+    out[:, 0] = [map_pdgid_to_candid(p, c) for p, c in zip(pdg, charge)]
+    for j, k in enumerate(GEN_TARGET_ORDER[1:], start=1):
+        out[:, j] = np.asarray(feats[k], dtype=np.float64).reshape(-1)
+    return out
 
 
 def _met_and_jets(features: Dict[str, np.ndarray]):
@@ -542,6 +562,7 @@ def _event_record_one(
         "genjet_withpu": genjet_withpu_np,
         "pufrac_track": pufrac_track,
         "pufrac_cluster": pufrac_cluster,
+        "gen_target": _gen_target_rows(gen_features),
     }
 
 
