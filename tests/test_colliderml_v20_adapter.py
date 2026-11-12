@@ -6,6 +6,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from mlpf.data.colliderml.make_test_fixture import make_fixture
+from mlpf.data.colliderml.postprocessing import process_one_file
 from mlpf.data.colliderml.reader import shard_paths
 from mlpf.data.colliderml.truth import DEFAULT_CALIBRATION, calibration_factors
 from mlpf.data.colliderml.v20_adapter import convert
@@ -177,3 +178,46 @@ def test_missing_cluster_file(tmp_path, adapted):
         assert got["total_energy"][i].as_py() == ref["total_energy"][i].as_py()
         lab = got["pandora_cluster"][i].as_py()
         assert lab == ([-1] * len(lab) if first <= eid <= last else ref["pandora_cluster"][i].as_py())
+
+
+ALGORITHMS = ("clue", "identity", "pandora")
+
+
+@pytest.fixture(scope="module")
+def converted(adapted):
+    tmp = adapted[0]
+    paths = [shard_paths(tmp / "src", "ttbar_pu0", o)[0] for o in ("particles", "tracks", "calo_hits", "tracker_hits")]
+    out = {}
+    for algo in ALGORITHMS:
+        ofn = tmp / f"out_{algo}" / paths[0].name
+        ofn.parent.mkdir()
+        process_one_file(*paths, ofn, algorithm=algo)
+        out[algo] = pq.read_table(ofn)
+    return tmp, paths, out
+
+
+def _calibrated_energy(calo, i):
+    return np.asarray(calo["total_energy"][i].as_py(), np.float64) * calibration_factors(np.asarray(calo["detector"][i].as_py()), DEFAULT_CALIBRATION)
+
+
+def test_identity_clusters(converted):
+    _, paths, out = converted
+    calo = pq.read_table(paths[2])
+    for i in range(calo.num_rows):
+        e = _calibrated_energy(calo, i)
+        xi = np.asarray(out["identity"]["X_cluster"][i].as_py())
+        assert len(xi) == (e > 0).sum()
+        np.testing.assert_allclose(np.sort(xi[:, 5]), np.sort(e[e > 0]), rtol=1e-5)
+
+
+def test_pandora_clusters(converted):
+    _, paths, out = converted
+    calo = pq.read_table(paths[2])
+    for i in range(calo.num_rows):
+        lab = np.asarray(calo["pandora_cluster"][i].as_py())
+        e = _calibrated_energy(calo, i)
+        xc = np.asarray(out["pandora"]["X_cluster"][i].as_py())
+        assert len(xc) == len(np.unique(lab[lab >= 0]))
+        np.testing.assert_allclose(xc[:, 5].sum(), e[lab >= 0].sum(), rtol=1e-5)
+        h2c = np.asarray(out["pandora"]["hit_to_cluster"][i].as_py())
+        assert ((h2c >= 0) == (lab >= 0)).all()

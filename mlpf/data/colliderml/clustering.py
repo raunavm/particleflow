@@ -16,7 +16,8 @@
 # radius-graph clusterers (radius_graph.py; defaults DEFAULT_REGION_RADII_MM /
 # DEFAULT_MERGE_FRAC, re-exported here), plus CLUE (`algorithm="clue"`), which lives in
 # clue.py (presets and defaults: clue.CLUE_PRESETS / DEFAULT_CLUE_PARAMS /
-# DEFAULT_CLUE_OPTIONS).
+# DEFAULT_CLUE_OPTIONS), plus one cluster per hit (`algorithm="identity"`) and the v20
+# Pandora clusters read from the input (`algorithm="pandora"`).
 #
 # Properties enforced by all clusterers (CLUE included):
 #   * deterministic per-event: identical inputs always give the same output
@@ -25,15 +26,32 @@
 #     radius max per pair, so ECAL cells can join HCAL cells when a shower crosses the
 #     detector boundary; CLUE: post-hoc ECAL->HCAL cluster linking via cross_region_mm)
 #   * energy-conserving: every retained hit belongs to exactly one cluster (only CLUE's
-#     optional drop_E / drop_1hit leave hits unclustered, with cluster -1 and no
-#     hit_to_cluster entry)
+#     optional drop_E / drop_1hit, identity's zero-energy hits and hits in no Pandora
+#     cluster are left unclustered, with cluster -1 and no hit_to_cluster entry)
 from typing import Any, Dict, Tuple
 
 import numpy as np
 
 from mlpf.data.colliderml.clue import _cluster_event_clue, resolve_clue_config
+from mlpf.data.colliderml.cluster_common import build_features, cluster_region, make_hit_to_cluster
 from mlpf.data.colliderml.radius_graph import DEFAULT_MERGE_FRAC, DEFAULT_REGION_RADII_MM, _cluster_event_bfs, _cluster_event_union_find
 from mlpf.data.target_building import SparseMatrixCOO
+
+
+def _cluster_event_from_labels(x, y, z, E, detector, labels):
+    """Clusters from a per-hit label (-1 for unclustered hits), renumbered in label order."""
+    labels = np.asarray(labels, dtype=np.int64)
+    if len(labels) != len(x):
+        raise ValueError(f"{len(labels)} labels for {len(x)} hits")
+    inc = labels >= 0
+    cluster_of = np.full(len(labels), -1, dtype=np.int64)
+    cluster_of[inc] = np.unique(labels[inc], return_inverse=True)[1]
+    if inc.all():
+        return cluster_of, build_features(x, y, z, E, detector, cluster_of), make_hit_to_cluster(cluster_of), cluster_region(cluster_of, detector)
+    co = cluster_of[inc]
+    feats = build_features(x[inc], y[inc], z[inc], np.asarray(E)[inc], detector[inc], co)
+    coo = (np.nonzero(inc)[0].astype(np.int64), co, np.ones(len(co), dtype=np.float32))
+    return cluster_of, feats, coo, cluster_region(co, detector[inc])
 
 
 def cluster_event(
@@ -47,10 +65,11 @@ def cluster_event(
     algorithm: str = "bfs_merge",
     clue_params: Dict[int, Dict[str, float]] | None = None,
     clue_options: Dict[str, Any] | None = None,
+    external_labels: np.ndarray | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, SparseMatrixCOO, np.ndarray]:
     """Cluster one event's calorimeter hits.
 
-    Four algorithms, selected by `algorithm`:
+    Six algorithms, selected by `algorithm`:
 
     - **bfs_merge** (default): seeded multi-source BFS watershed (strict local maxima claim
       hits by hop count) + a Pandora-style fragment merge over the seed clusters that touch
@@ -64,6 +83,8 @@ def cluster_event(
     - **bfs**: raw seeded BFS on the radius graph, no merging.
     - **clue**: CLUE density-peak clustering per region (clue.py); radii_mm
       and merge_frac are ignored, clue_params/clue_options configure it.
+    - **identity**: one cluster per calorimeter hit with E > 0.
+    - **pandora**: the v20 Pandora clusters given per hit in external_labels.
 
     Args:
       x, y, z:     float32/64 positions in mm, length N
@@ -73,11 +94,12 @@ def cluster_event(
       merge_frac:  None (per-algorithm defaults), 0.0 (disable merging), or a fraction.
                   For bfs_merge this is the fragment-absorption threshold; for union_find
                   this is the link-refusal gate.
-      algorithm:   "bfs_merge" | "union_find" | "bfs" | "clue"
+      algorithm:   "bfs_merge" | "union_find" | "bfs" | "clue" | "identity" | "pandora"
       clue_params: per-region overrides of DEFAULT_CLUE_PARAMS for "clue", e.g.
                    {9: {"dc": 8.0}}; keys dc, rhoc, dm, seed_dc, alpha (see clue.py's header)
       clue_options: overrides of DEFAULT_CLUE_OPTIONS for "clue" (keys in clue.py's header;
                    clue.CLUE_PRESETS holds the named per-pileup settings)
+      external_labels: per-hit cluster index for "pandora", -1 for hits in no cluster
     """
 
     # ColliderML parquet columns are option-typed, so ak.to_numpy hands us numpy.ma
@@ -108,5 +130,12 @@ def cluster_event(
     elif algorithm == "clue":
         params, options = resolve_clue_config(params=clue_params, options=clue_options)
         return _cluster_event_clue(x, y, z, E, detector, params, **options)
+    elif algorithm == "pandora":
+        if external_labels is None:
+            raise ValueError("algorithm 'pandora' needs external_labels")
+        return _cluster_event_from_labels(x, y, z, E, detector, _plain(external_labels))
+    elif algorithm == "identity":
+        # zero-energy hits have no energy-weighted position
+        return _cluster_event_from_labels(x, y, z, E, detector, np.where(np.asarray(E) > 0, np.arange(len(x)), -1))
     else:
-        raise ValueError(f"algorithm must be 'bfs_merge', 'union_find', 'bfs' or 'clue', got {algorithm!r}")
+        raise ValueError(f"algorithm must be 'bfs_merge', 'union_find', 'bfs', 'clue', 'identity' or 'pandora', got {algorithm!r}")

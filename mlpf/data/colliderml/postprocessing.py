@@ -233,6 +233,7 @@ def _event_record_one(
         radii_mm=radii_mm,
         clue_params=clue_params,
         clue_options=clue_options,
+        external_labels=ak.to_numpy(calo_ev["pandora_cluster"]) if algorithm == "pandora" else None,
     )
     n_cluster = len(cl_feats)
     pufrac_track, pufrac_cluster = _element_pu_fraction(particles_ev, tracks_ev, tracker_ev, calo_ev, cluster_of, n_cluster, all_pileup=all_pileup)
@@ -777,10 +778,11 @@ def main():
     parser.add_argument(
         "--algorithm",
         type=str,
-        choices=("union_find", "bfs", "bfs_merge", "clue"),
+        choices=("union_find", "bfs", "bfs_merge", "clue", "identity", "pandora"),
         default="bfs_merge",
         help="clustering algorithm; clue = CLUE density-peak clustering (mlpf/data/colliderml/clue.py; ignores "
-        "--merge-frac/--radii-*). Its defaults are the pu0 setting: for pileup samples use --clue-preset pu200.",
+        "--merge-frac/--radii-*). Its defaults are the pu0 setting: for pileup samples use --clue-preset pu200. "
+        "identity = one cluster per calo hit with E > 0; pandora = the v20 Pandora clusters written by v20_adapter.py.",
     )
     parser.add_argument(
         "--merge-frac",
