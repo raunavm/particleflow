@@ -1042,6 +1042,12 @@ class SetDecoderConfig(BaseModel):
     tracker_fit_max_log_correction: float = Field(default=0.4054651081081644, gt=0.0)  # log(1.5)
     tracker_group_magnetic_field: float = Field(default=2.0, gt=0.0)  # tesla; CLD solenoid
     event_consistency_loss_weight: float = Field(default=0.0, ge=0.0)
+    # targets beyond num_slots stay unmatched (counted, no loss) instead of raising
+    allow_unmatched_targets: bool = False
+    # threads for the per-event Hungarian assignments
+    matching_threads: int = Field(default=1, ge=1)
+    # presence loss: weighted mean over the slots, or the weighted sum over the number of slots
+    presence_normalization: Literal["mean", "num_slots"] = "mean"
     matcher: SetMatcherConfig = Field(default_factory=SetMatcherConfig)
 
     @model_validator(mode="after")

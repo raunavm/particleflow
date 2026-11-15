@@ -400,6 +400,9 @@ def _set_loss_kwargs(model_module, raw_predictions):
         "tracker_loss_max_hits": config.tracker_loss_max_hits,
         "tracker_group_magnetic_field": config.tracker_group_magnetic_field,
         "event_consistency_loss_weight": config.event_consistency_loss_weight,
+        "allow_unmatched_targets": config.allow_unmatched_targets,
+        "matching_threads": config.matching_threads,
+        "presence_normalization": config.presence_normalization,
     }
 
 
@@ -1042,6 +1045,7 @@ def evaluate(
                             ypred,
                             batch.target_mask,
                             SetMatcherWeights(**model_module.config.set_decoder.matcher.model_dump()),
+                            allow_unmatched_targets=model_module.config.set_decoder.allow_unmatched_targets,
                         )
                         grouping_metrics = compute_hit_grouping_metrics(
                             ypred_raw.hit_grouping,

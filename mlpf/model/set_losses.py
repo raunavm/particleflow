@@ -1,4 +1,5 @@
 import math
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import torch
@@ -60,16 +61,21 @@ def _nonfinite_field_summary(values, keys):
     return "; ".join(failures) if failures else "none"
 
 
-def hungarian_match(targets, predictions, target_mask, weights=None):
-    """Match particle slots to targets independently for each event."""
+def hungarian_match(targets, predictions, target_mask, weights=None, allow_unmatched_targets=False, num_threads=1):
+    """Match particle slots to targets independently for each event.
+
+    allow_unmatched_targets: an event with more targets than slots leaves the extra targets unmatched instead of raising.
+    num_threads > 1 solves the per-event assignments in a thread pool; the matches are the same.
+    """
 
     weights = weights or SetMatcherWeights()
     matches = []
+    jobs = []
     num_slots = predictions["cls_binary"].shape[1]
     for event_idx in range(predictions["cls_binary"].shape[0]):
         valid = target_mask[event_idx].bool()
         num_targets = int(valid.sum().item())
-        if num_targets > num_slots:
+        if num_targets > num_slots and not allow_unmatched_targets:
             raise ValueError(f"Event {event_idx} has {num_targets} targets but the decoder has only {num_slots} slots")
         if num_targets == 0:
             empty = torch.empty(0, dtype=torch.long, device=predictions["cls_binary"].device)
@@ -94,12 +100,17 @@ def hungarian_match(targets, predictions, target_mask, weights=None):
                 f"target {target_idx} (padded row {target_row}), value={cost_cpu[slot_idx, target_idx].item()}; "
                 f"prediction fields: {prediction_fields}; target fields: {target_fields}"
             )
-        slot_indices, target_indices = linear_sum_assignment(cost_cpu.numpy())
-        matches.append(
-            (
-                torch.as_tensor(slot_indices, dtype=torch.long, device=cost.device),
-                torch.as_tensor(target_indices, dtype=torch.long, device=cost.device),
-            )
+        matches.append(None)
+        jobs.append((len(matches) - 1, cost_cpu.numpy(), cost.device))
+    if num_threads > 1 and len(jobs) > 1:
+        with ThreadPoolExecutor(max_workers=min(num_threads, len(jobs))) as pool:
+            solved = list(pool.map(lambda job: linear_sum_assignment(job[1]), jobs))
+    else:
+        solved = [linear_sum_assignment(job[1]) for job in jobs]
+    for (position, _, device), (slot_indices, target_indices) in zip(jobs, solved):
+        matches[position] = (
+            torch.as_tensor(slot_indices, dtype=torch.long, device=device),
+            torch.as_tensor(target_indices, dtype=torch.long, device=device),
         )
     return matches
 
@@ -115,8 +126,13 @@ def set_event_loss(
     matches=None,
     momentum_loss="mse",
     momentum_huber_delta=0.2,
+    presence_normalization="mean",
 ):
-    """Permutation-invariant particle-set loss for a padded event batch."""
+    """Permutation-invariant particle-set loss for a padded event batch.
+
+    presence_normalization: the presence loss is the weighted mean over the slots ("mean") or the weighted sum over the
+    slots divided by their number ("num_slots").
+    """
 
     if matches is None:
         matches = hungarian_match(targets, predictions, target_mask, matcher_weights)
@@ -136,19 +152,21 @@ def set_event_loss(
             matched_targets[key].append(targets[key][event_idx, valid_targets][target_indices])
 
     presence_class_weights = predictions["cls_binary"].new_tensor([no_object_weight, 1.0])
-    losses = {
-        "Classification_binary": F.cross_entropy(
-            predictions["cls_binary"].reshape(-1, 2),
-            presence_targets.reshape(-1),
-            weight=presence_class_weights,
-        )
-    }
+    presence_loss = F.cross_entropy(
+        predictions["cls_binary"].reshape(-1, 2),
+        presence_targets.reshape(-1),
+        weight=presence_class_weights,
+        reduction="sum" if presence_normalization == "num_slots" else "mean",
+    )
+    if presence_normalization == "num_slots":
+        presence_loss = presence_loss / presence_targets.numel()
+    losses = {"Classification_binary": presence_loss}
     if cardinality_loss_weight > 0:
         predicted_count = F.softmax(predictions["cls_binary"].float(), dim=-1)[..., 1].sum(dim=1)
         target_count = target_mask.sum(dim=1).to(dtype=predicted_count.dtype)
         losses["Cardinality"] = cardinality_loss_weight * F.smooth_l1_loss(predicted_count, target_count)
 
-    num_matched = int(presence_targets.sum().item())
+    num_matched = sum(len(slot_indices) for slot_indices, _ in matches)
     if num_matched == 0:
         # Keep every set-output head in the autograd graph even for a batch with
         # no target particles. This produces zero gradients for PID and momentum
@@ -204,11 +222,21 @@ def set_mlpf_loss(
     tracker_loss_max_hits=64,
     tracker_group_magnetic_field=2.0,
     event_consistency_loss_weight=0.0,
+    allow_unmatched_targets=False,
+    matching_threads=1,
+    presence_normalization="mean",
 ):
-    """Compute the set-prediction objective with the standard task names."""
+    """Compute the set-prediction objective with the standard task names.
+
+    allow_unmatched_targets logs UnmatchedTargets (count) and UnmatchedTargetFraction.
+    """
 
     if batch.target_mask is None:
         raise ValueError("Set prediction requires batch.ytarget_set and batch.target_mask")
+
+    matches = hungarian_match(
+        targets, predictions, batch.target_mask, matcher_weights, allow_unmatched_targets=allow_unmatched_targets, num_threads=matching_threads
+    )
 
     effective_regression_weights = regression_weights if task_loss_weighter is None else {feature: 1.0 for feature in REGRESSION_FEATURES}
     losses, matches = set_event_loss(
@@ -219,8 +247,10 @@ def set_mlpf_loss(
         matcher_weights=matcher_weights,
         no_object_weight=no_object_weight,
         cardinality_loss_weight=cardinality_loss_weight,
+        matches=matches,
         momentum_loss=momentum_loss,
         momentum_huber_delta=momentum_huber_delta,
+        presence_normalization=presence_normalization,
     )
     task_losses = {task: losses[task] for task in LOSS_TASKS}
     if task_loss_weighter is None:
@@ -233,6 +263,11 @@ def set_mlpf_loss(
 
     if "Cardinality" in losses:
         loss_opt = loss_opt + losses["Cardinality"]
+    if allow_unmatched_targets:
+        total = batch.target_mask.sum()
+        unmatched = total - sum(len(slot_indices) for slot_indices, _ in matches)
+        losses["UnmatchedTargets"] = unmatched.float()
+        losses["UnmatchedTargetFraction"] = unmatched.float() / total.clamp_min(1)
 
     if hit_grouping is not None:
         grouping_loss = hit_grouping_loss(
@@ -294,6 +329,7 @@ def set_mlpf_loss(
                 momentum_loss=momentum_loss,
                 momentum_huber_delta=momentum_huber_delta,
                 matches=matches,
+                presence_normalization=presence_normalization,
             )
             auxiliary_losses.append(sum(layer_losses.values()))
         losses["Auxiliary"] = auxiliary_loss_weight * torch.stack(auxiliary_losses).mean()
