@@ -93,6 +93,10 @@ def dataset_source_id(dataset_name: str) -> int:
     return SOURCE_IDS["unknown"]
 
 
+# ColliderML v20/v22 pf datasets that carry gen_target, the targets of set output on them
+V20_SET_PF_DATASETS = ("colliderml_ttbar_pu0_v20_pf", "colliderml_ttbar_pu200_v22_pf_blocks")
+
+
 def dataset_input_type_id(dataset_name: str) -> int:
     if "_hits" in dataset_name:
         return INPUT_TYPE_IDS["hits"]
@@ -1419,6 +1423,8 @@ class MLPFConfig(BaseModel):
     make_plots: bool = True
     sort_data: bool = False
     sampler_mode: DatasetSamplerMode = DatasetSamplerMode.SHARD_CONSECUTIVE  # use interleaved-shards for groups of several samples
+    # set-output targets: the representative element rows of ytarget, or the gen_target rows of the record
+    set_target_source: Literal["element_rows", "gen_target"] = "element_rows"
     load: Optional[str] = None  # path to model and optimizer checkpoint to load
     relaxed_load: bool = False  # if enabled, skip layer mismatch and optimizer in loading
     load_weights_only: bool = False  # load only the model weights from --load; optimizer, LR schedule, RNG, sampler and step start fresh
@@ -1465,8 +1471,13 @@ class MLPFConfig(BaseModel):
             if self.elemtypes_nonzero is None:
                 self.elemtypes_nonzero = ELEM_TYPES_NONZERO[self.dataset.value]
         if self.model.output_mode == OutputMode.SET:
-            if self.dataset not in (Dataset.CLD_HITS, Dataset.CLIC_HITS, Dataset.COLLIDERML_HITS):
-                raise ValueError("model.output_mode='set' is currently supported only for the CLD/CLIC/ColliderML hit datasets")
+            names = {name for name, _ in self._samples()}
+            v20_pf = self.dataset == Dataset.COLLIDERML and names and names <= set(V20_SET_PF_DATASETS)
+            if self.dataset not in (Dataset.CLD_HITS, Dataset.CLIC_HITS, Dataset.COLLIDERML_HITS) and not v20_pf:
+                raise ValueError(
+                    "model.output_mode='set' is currently supported only for the CLD/CLIC/ColliderML hit datasets "
+                    f"and, with every sample among them, the ColliderML pf datasets {V20_SET_PF_DATASETS}"
+                )
             if self.model.set_decoder is None:
                 self.model.set_decoder = SetDecoderConfig()
             if self.model.backbone.mode != BackboneMode.SHARED:

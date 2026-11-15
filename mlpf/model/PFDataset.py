@@ -32,8 +32,71 @@ except Exception as e:
     _logger.warning(f"Could not set RLIMIT_NOFILE: {e}")
 
 
+def gen_target_to_set(gen_target):
+    """Set targets in the Y_FEATURES column order from gen_target rows, with log pt and log energy.
+
+    gen_target columns are cls (0..5), charge, pt, eta, sin_phi, cos_phi, energy, ispu, gp_to_track, gp_to_cluster.
+    jet_idx is -1 and particle_number is the gen_target row + 1.
+    """
+    gen = np.asarray(gen_target, dtype=np.float32).reshape(-1, 10)
+    ys = np.zeros((len(gen), len(Y_FEATURES)), dtype=np.float32)
+    for name, col in (("PDG", 0), ("charge", 1), ("eta", 3), ("sin_phi", 4), ("cos_phi", 5), ("ispu", 7), ("gp_to_track", 8), ("gp_to_cluster", 9)):
+        ys[:, Y_FEATURES.index(name)] = gen[:, col]
+    ys[:, Y_FEATURES.index("pt")] = np.log(np.clip(gen[:, 2], 1e-8, None))
+    ys[:, Y_FEATURES.index("energy")] = np.log(np.clip(gen[:, 6], 1e-8, None))
+    ys[:, Y_FEATURES.index("jet_idx")] = -1
+    ys[:, Y_FEATURES.index("particle_number")] = np.arange(1, len(gen) + 1)
+    return ys
+
+
+def uses_hit_grouping(config):
+    """Set output with hit grouping, the only reader of the element particle_number in training."""
+    set_decoder = config.model.set_decoder
+    return config.model.output_mode == OutputMode.SET and set_decoder is not None and set_decoder.hit_grouping
+
+
+def align_particle_numbers(rec):
+    """Renumber the element particle_number of rec["ytarget"] to gen_target row + 1.
+
+    Element rows carry the allocator's particle numbers after merges, while gen_target lists every visible particle. The
+    kept particles are an in-order subsequence of gen_target, and each host row keeps its gen_target gp_to_track and
+    gp_to_cluster, so an in-order match on those two keys maps one numbering to the other.
+    """
+    gen = np.asarray(rec["gen_target"], dtype=np.float32).reshape(-1, 10)
+    y = np.array(rec["ytarget"], dtype=np.float32)
+    pn_index, gt_index, gc_index = (Y_FEATURES.index(k) for k in ("particle_number", "gp_to_track", "gp_to_cluster"))
+    pn = y[:, pn_index].astype(np.int64)
+    host = y[:, 0] != 0
+    n_post = int(pn[host].max()) if host.any() else 0
+    if n_post == len(gen):
+        return
+    post = np.zeros((n_post, 2), dtype=np.float32)
+    post[pn[host] - 1] = y[host][:, [gt_index, gc_index]]
+    mapping = np.zeros(n_post + 1, dtype=np.int64)
+    j = 0
+    for k in range(n_post):
+        while j < len(gen) and not (gen[j, 8] == post[k, 0] and gen[j, 9] == post[k, 1]):
+            j += 1
+        if j == len(gen):
+            raise ValueError(f"event {rec.get('event_id')}: kept particle {k + 1} of {n_post} has no gen_target row with its keys")
+        mapping[k + 1] = j + 1
+        j += 1
+    y[:, pn_index] = mapping[np.clip(pn, 0, n_post)]
+    rec["ytarget"] = y
+
+
 class TFDSDataSource:
-    def __init__(self, ds, sort, pad_to_multiple=None, feature_dim=None, max_open_readers=None, build_target_set=False):
+    def __init__(
+        self,
+        ds,
+        sort,
+        pad_to_multiple=None,
+        feature_dim=None,
+        max_open_readers=None,
+        build_target_set=False,
+        set_target_source="element_rows",
+        align_particle_numbers=False,
+    ):
         self.ds = ds
         tmp = self.ds.dataset_info
         self.ds.dataset_info = SimpleNamespace()
@@ -45,6 +108,8 @@ class TFDSDataSource:
         self.feature_dim = feature_dim
         self.max_open_readers = max_open_readers
         self.build_target_set = build_target_set
+        self.set_target_source = set_target_source
+        self.align_particle_numbers = align_particle_numbers
 
     def _close_extra_readers(self):
         # ArrayRecordDataSource caches one reader per shard file forever, so the
@@ -152,7 +217,11 @@ class TFDSDataSource:
             e = ret["X"][:, 5][msk_ho]
             ret["X"][:, 1][msk_ho] = np.sqrt(e**2 - (np.tanh(eta) * e) ** 2)
 
-        if self.build_target_set:
+        if self.build_target_set and self.set_target_source == "gen_target":
+            if self.align_particle_numbers:
+                align_particle_numbers(ret)
+            ret["ytarget_set"] = gen_target_to_set(ret["gen_target"])
+        elif self.build_target_set:
             # Existing hit datasets store one full target row on an exclusive
             # representative hit for every particle. Other related hits contain
             # only particle_number, so nonzero class rows form the compact set.
@@ -215,6 +284,8 @@ class PFDataset:
         feature_dim=None,
         max_open_readers=None,
         build_target_set=False,
+        set_target_source="element_rows",
+        align_particle_numbers=False,
     ):
         """
         Args
@@ -242,6 +313,8 @@ class PFDataset:
             feature_dim=feature_dim,
             max_open_readers=max_open_readers,
             build_target_set=build_target_set,
+            set_target_source=set_target_source,
+            align_particle_numbers=align_particle_numbers,
         )
 
         if num_samples and num_samples < len(self.ds):
@@ -807,6 +880,8 @@ def get_interleaved_dataloaders(world_size, rank, config: MLPFConfig, use_cuda, 
                         feature_dim=config.input_dim,
                         max_open_readers=config.max_open_readers,
                         build_target_set=config.model.output_mode == OutputMode.SET,
+                        set_target_source=config.set_target_source,
+                        align_particle_numbers=uses_hit_grouping(config),
                     ).ds
 
                     if (rank == 0) or (rank == "cpu"):

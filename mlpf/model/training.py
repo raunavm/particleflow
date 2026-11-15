@@ -86,6 +86,7 @@ from mlpf.model.PFDataset import (
     PFDataset,
     get_interleaved_dataloaders,
     set_worker_sharing_strategy,
+    uses_hit_grouping,
 )
 from mlpf.model.losses import (
     LOSS_TASKS,
@@ -98,7 +99,7 @@ from mlpf.model.set_losses import SetMatcherWeights, hungarian_match, set_mlpf_l
 from mlpf.model.reconstruction_diagnostics import compute_hit_grouping_metrics
 from mlpf.model.validation_metrics import compute_set_slot_metrics, compute_validation_particle_metrics, validation_particle_collections
 from mlpf.utils import create_comet_experiment
-from mlpf.conf import INPUT_TYPE_LABELS, MLPFConfig, OutputMode, SOURCE_LABELS, dataset_for_sample
+from mlpf.conf import INPUT_TYPE_LABELS, Dataset, MLPFConfig, OutputMode, SOURCE_LABELS, dataset_for_sample
 from mlpf.jet_utils import get_jet_config
 
 from mlpf.model.benchmarking import active_benchmark, benchmark_phase, record_benchmark, record_phase
@@ -1047,6 +1048,7 @@ def evaluate(
                             batch,
                             matches,
                             chunk_size=model_module.config.set_decoder.hit_grouping_chunk_size,
+                            coverage=config.dataset != Dataset.COLLIDERML,
                         )
                         for metric_name, (metric_total, metric_count) in grouping_metrics.items():
                             _add_accumulator(
@@ -1678,6 +1680,8 @@ def run_test(rank, world_size, config: MLPFConfig, outdir, model, sample, testdi
             feature_dim=config.input_dim,
             max_open_readers=config.max_open_readers,
             build_target_set=config.model.output_mode == OutputMode.SET,
+            set_target_source=config.set_target_source,
+            align_particle_numbers=uses_hit_grouping(config),
         ).ds
         dataset.append(ds)
     ds = torch.utils.data.ConcatDataset(dataset)

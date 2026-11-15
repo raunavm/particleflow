@@ -165,8 +165,10 @@ def _empty_grouping_metrics():
 
 
 @torch.no_grad()
-def compute_hit_grouping_metrics(grouping, batch, matches, chunk_size=1024):
+def compute_hit_grouping_metrics(grouping, batch, matches, chunk_size=1024, coverage=True):
     """Score actual all-slot hard grouping aligned by training Hungarian matches.
+
+    coverage=False drops the layer-coverage scopes, which need the EDM4hep hit columns system, side and layer.
 
     Reconstruct scores in chunks; retain only winners and a slot-by-target
     contingency table, never a full hit-by-slot map.
@@ -235,13 +237,16 @@ def compute_hit_grouping_metrics(grouping, batch, matches, chunk_size=1024):
             if kind == 2:
                 _add(metrics, f"{detector}/energy_purity", overlap_energy.sum(), energy_table[:slots].sum())
                 _add(metrics, f"{detector}/energy_completeness", overlap_energy.sum(), true_energy.sum())
-            coverage = torch.zeros(n, dtype=torch.long)
-            surface_columns = [features.index(key) for key in ("system", "side", "layer")]
-            for target_id in range(n):
-                surfaces = x[mask & (truth == target_id)][:, surface_columns]
-                coverage[target_id] = len(torch.unique(surfaces, dim=0))
+            binnings = [(PT_BINS, pt), (ETA_BINS, eta.abs()), (DENSITY_BINS, neighbors)]
+            if coverage:
+                surfaces_hit = torch.zeros(n, dtype=torch.long)
+                surface_columns = [features.index(key) for key in ("system", "side", "layer")]
+                for target_id in range(n):
+                    surfaces = x[mask & (truth == target_id)][:, surface_columns]
+                    surfaces_hit[target_id] = len(torch.unique(surfaces, dim=0))
+                binnings.insert(2, (COVERAGE_BINS, surfaces_hit))
             scopes = {"all": true_count > 0}
-            for bins, value in ((PT_BINS, pt), (ETA_BINS, eta.abs()), (COVERAGE_BINS, coverage), (DENSITY_BINS, neighbors)):
+            for bins, value in binnings:
                 scopes.update({name: (true_count > 0) & (value >= low) & (value < high) for name, low, high in bins})
             for scope, selected in scopes.items():
                 prefix = f"{detector}/{scope}"
