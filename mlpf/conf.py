@@ -1099,6 +1099,8 @@ class ModelArchitectureConfig(BaseModel):
     feature_bag: bool = False
     # scaled and Fourier input features of ColliderML elements for the input embedding (mlpf/model/input_features.py)
     colliderml_input_features: bool = False
+    # appends each track's calorimeter entry direction to the scaled input features
+    colliderml_track_entry_features: bool = False
 
     # Nested configs
     gnnlsh: Optional[GNNLSHConfig] = None
@@ -1513,6 +1515,8 @@ class MLPFConfig(BaseModel):
                 raise ValueError(f"model.feature_bag supports track/cluster samples of {list(TRACK_CLUSTER_SOURCES)}, not {unsupported}")
         if self.model.colliderml_input_features and (self.dataset != Dataset.COLLIDERML or self.model.input_normalization or self.model.feature_bag):
             raise ValueError("model.colliderml_input_features reads the ColliderML pf layout, without input_normalization or feature_bag")
+        if self.model.colliderml_track_entry_features and not self.model.colliderml_input_features:
+            raise ValueError("model.colliderml_track_entry_features needs model.colliderml_input_features")
         if self.model.input_normalization:
             hits = sorted(name for name, _ in self._samples() if dataset_input_type_id(name) != INPUT_TYPE_IDS["pf"])
             if hits:

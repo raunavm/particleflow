@@ -7,13 +7,17 @@ and adds Fourier features of eta, phi and the distance from the origin. It runs 
 X_features still reach seeding, the heads and the element-type masks.
 
 With use_layer, X column 17 holds the calorimeter layer of the element, scaled by the number of layers of the
-calorimeter with more energy.
+calorimeter with more energy. With track_entry, the features end with the calorimeter entry direction of each track
+(calo_entry.calo_entry_eta_phi) and the own direction of each calorimeter element.
 """
 
 import math
 
 import torch
 from torch import nn
+
+from mlpf.conf import Dataset
+from mlpf.model.calo_entry import CALO_ENTRY_GEOMETRY_MM, calo_entry_eta_phi
 
 HCAL_SATURATION_GEV = 0.6
 ECAL_CLIP_GEV = 9.68
@@ -27,11 +31,13 @@ def _log(v, floor=1e-4):
 class ColliderMLInputFeatures(nn.Module):
     NUM_BASE = 21
     NUM_BANDS = 8  # per coordinate: phi, eta, distance
+    NUM_ENTRY = 3 + 2 * 2 * NUM_BANDS
 
-    def __init__(self, use_layer=False):
+    def __init__(self, use_layer=False, track_entry=False):
         super().__init__()
         self.use_layer = bool(use_layer)
-        self.num_output_features = self.NUM_BASE + int(self.use_layer) + 2 * 3 * self.NUM_BANDS
+        self.num_entry = self.NUM_ENTRY if track_entry else 0
+        self.num_output_features = self.NUM_BASE + int(self.use_layer) + 2 * 3 * self.NUM_BANDS + self.num_entry
         bands = 2.0 ** torch.arange(1, self.NUM_BANDS + 1, dtype=torch.float32)
         self.register_buffer("phi_freq", bands, persistent=False)
         self.register_buffer("eta_freq", math.pi * bands / 2.5, persistent=False)
@@ -83,5 +89,12 @@ class ColliderMLInputFeatures(nn.Module):
                 dim=-1,
             )
             out = torch.cat([torch.stack(columns, dim=-1), torch.sin(angles), torch.cos(angles)], dim=-1)
+            if self.num_entry:
+                # track columns 7, 10, 11 are z0, tanLambda, omega
+                e_eta, e_phi = calo_entry_eta_phi(phi, x[..., 7], x[..., 10], x[..., 11], *CALO_ENTRY_GEOMETRY_MM[Dataset.COLLIDERML.value])
+                e_eta, e_phi = torch.where(is_track, e_eta, x[..., 2]), torch.where(is_track, e_phi, phi)
+                e_angles = torch.cat([e_phi.unsqueeze(-1) * self.phi_freq, e_eta.unsqueeze(-1) * self.eta_freq], dim=-1)
+                entry = torch.stack([e_eta / 3.0, torch.sin(e_phi), torch.cos(e_phi)], dim=-1)
+                out = torch.cat([out, entry, torch.sin(e_angles), torch.cos(e_angles)], dim=-1)
             valid = (is_track | is_calo).unsqueeze(-1)
             return torch.where(valid, out, torch.zeros_like(out))

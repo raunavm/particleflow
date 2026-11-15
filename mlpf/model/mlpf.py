@@ -1257,7 +1257,11 @@ class MLPF(nn.Module):
         self.feature_bag = FeatureBag(self.raw_input_dim) if config.model.feature_bag else None
         if self.feature_bag is not None:
             self.input_dim = self.feature_bag.num_features
-        self.scaled_inputs = ColliderMLInputFeatures(config.colliderml_data.use_layer) if config.model.colliderml_input_features else None
+        self.scaled_inputs = (
+            ColliderMLInputFeatures(config.colliderml_data.use_layer, config.model.colliderml_track_entry_features)
+            if config.model.colliderml_input_features
+            else None
+        )
         if self.scaled_inputs is not None:
             self.input_dim = self.scaled_inputs.num_output_features
         self.num_classes = config.num_classes

@@ -98,3 +98,42 @@ def test_model_flag_changes_only_the_input_embedding():
     d["dataset"] = "cld"
     with pytest.raises(ValueError, match="colliderml_input_features"):
         MLPFConfig.model_validate(d)
+
+
+def test_entry_block_holds_the_entry_point_for_tracks_and_the_own_direction_for_calorimeter_elements():
+    from mlpf.conf import Dataset
+    from mlpf.model.calo_entry import CALO_ENTRY_GEOMETRY_MM, calo_entry_eta_phi
+
+    tracks = []
+    for z0, eta, omega in ((0.0, 0.3, 1.0 / 3000.0), (30.0, -0.8, -1.0 / 1500.0), (-50.0, 1.2, 1.0 / 800.0)):
+        t = _track()
+        t[2], t[7], t[10], t[11] = eta, z0, math.sinh(eta), omega
+        tracks.append(t)
+    X = torch.tensor([tracks + [_calo(5.0), _calo(0.5, z=-200.0)]])
+    off, on = ColliderMLInputFeatures(), ColliderMLInputFeatures(track_entry=True)
+    a, b = off(X), on(X)
+    n = ColliderMLInputFeatures.NUM_ENTRY
+    assert on.num_output_features == off.num_output_features + n == b.shape[-1] and torch.equal(b[..., :-n], a)
+    phi0 = torch.atan2(X[0, :, 3], X[0, :, 4])
+    eta_e, phi_e = calo_entry_eta_phi(phi0[:3], X[0, :3, 7], X[0, :3, 10], X[0, :3, 11], *CALO_ENTRY_GEOMETRY_MM[Dataset.COLLIDERML.value])
+    block = b[0, :, -n:]
+    assert torch.allclose(block[:3, 0], eta_e / 3.0, atol=1e-6) and torch.allclose(block[:3, 1], torch.sin(phi_e), atol=1e-6)
+    assert (phi_e - phi0[:3]).abs().min() > 0.05
+    assert torch.allclose(block[3:, 0], X[0, 3:, 2] / 3.0) and torch.allclose(block[3:, 1], X[0, 3:, 3])
+
+
+def test_entry_features_need_the_scaled_inputs():
+    from mlpf.conf import MLPFConfig
+
+    d = {
+        "dataset": "colliderml",
+        "data_dir": "/tmp",
+        "model": {
+            "type": "attention",
+            "attention": {"num_convs": 1, "num_heads": 2, "head_dim": 8, "attention_type": "math"},
+            "colliderml_track_entry_features": True,
+        },
+        "conv_type": "attention",
+    }
+    with pytest.raises(ValueError, match="needs model.colliderml_input_features"):
+        MLPFConfig.model_validate(d)
