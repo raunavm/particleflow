@@ -18,6 +18,13 @@ def test_set_configs_build_and_take_a_cpu_step(name):
     config = MLPFConfig.from_spec(SPEC, name, "colliderml")
     assert config.set_target_source == "gen_target" and config.input_dim == 18 and config.model.colliderml_input_features
     assert config.crop.enabled == name.endswith("crops") and config.colliderml_data.host_class_targets == name.endswith("crops")
+    assert config.num_steps == 20000 and config.gradient_accumulation_steps == 4 and config.task_loss_weights.calibration_steps == 400
+    assert config.optimizer.value == "adamw" and config.gradient_clip_norm == 1.0 and config.ntest == 0
+    batch_size = config.train_dataset["colliderml"]["physical"].batch_size
+    if name.endswith("crops"):
+        assert batch_size == 2 and config.crop.guard == 0.2 and config.crop.crops_per_event == 4
+    else:
+        assert batch_size == 8
     decoder = config.model.set_decoder
     assert (decoder.calo_seed_local_max_radius is not None) == ("seedmax" in name)
     MLPF(config)

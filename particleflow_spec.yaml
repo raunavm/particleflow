@@ -1595,8 +1595,16 @@ models:
     dataset: colliderml
     gpu_batch_multiplier: 1
     ntest: 0
+    num_steps: 20000
     optimizer: adamw
     gradient_clip_norm: 1.0
+    # batches of 8 events in 4 micro-batches of 2; the calibration counts micro-batches
+    gradient_accumulation_steps: 4
+    task_loss_weights:
+      calibration_steps: 400
+      epsilon: 1.0e-8
+      min_weight: 1.0e-2
+      max_weight: 1.0e3
     lr_schedule: onecycle
     lr_schedule_config:
       onecycle:
@@ -1679,15 +1687,18 @@ models:
   # The same model on the PU200 v22 blocks, trained on (eta, phi) crops of each event with host-class targets.
   pyg-colliderml-pu200-v22-set-hits-crops:
     <<: *pyg_colliderml_pu0_v20_set_hits
+    # batches of 2 events x 4 crops, in 4 micro-batches of 2 crops
     crop:
       enabled: true
+      guard: 0.2
+      crops_per_event: 4
     colliderml_data:
       use_layer: true
       host_class_targets: true
 
     train_datasets:
       physical:
-        batch_size: 8
+        batch_size: 2
         samples:
           - name: "colliderml_ttbar_pu200_v22_pf_blocks"
             version: "1.2.0"
