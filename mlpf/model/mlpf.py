@@ -20,6 +20,7 @@ from mlpf.model.hept import HEPTLayer, trunc_normal_
 from mlpf.model.heptv2 import HEPTv2Layer
 from mlpf.model.input_normalization import InputNormalization
 from mlpf.model.feature_bag import FeatureBag
+from mlpf.model.input_features import ColliderMLInputFeatures
 from mlpf.model.calo_entry import ClusterCentroid, TrackCaloEntry
 from mlpf.model.tracker_features import TrackerDoubletFeatures
 from mlpf.model.set_decoder import ParticleSetDecoder
@@ -1256,6 +1257,9 @@ class MLPF(nn.Module):
         self.feature_bag = FeatureBag(self.raw_input_dim) if config.model.feature_bag else None
         if self.feature_bag is not None:
             self.input_dim = self.feature_bag.num_features
+        self.scaled_inputs = ColliderMLInputFeatures() if config.model.colliderml_input_features else None
+        if self.scaled_inputs is not None:
+            self.input_dim = self.scaled_inputs.num_output_features
         self.num_classes = config.num_classes
         self.elemtypes_nonzero = config.elemtypes_nonzero
 
@@ -1745,6 +1749,8 @@ class MLPF(nn.Module):
         encoder = self.nn0 if encoder is None else encoder
         X_features = X_features if self.input_normalization is None else self.input_normalization(X_features, source_id)
         inputs = X_features if self.feature_bag is None else self.feature_bag(X_features, source_id)
+        if self.scaled_inputs is not None:
+            inputs = self.scaled_inputs(X_features)
         if self.input_encoding == InputEncoding.JOINT:
             encoded = encoder(inputs)
         if self.input_encoding == InputEncoding.SPLIT:
