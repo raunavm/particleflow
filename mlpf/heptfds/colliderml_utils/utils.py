@@ -180,7 +180,27 @@ def generate_examples(files: List[Path]):
 V20_PU0_LAYOUT = {"train": (0, 7679), "test": (7680, 8319), "val_read": (8320, 8959), "report": (8960, 10239), "n_report": 10}
 V20_RANGES = ("train", "test", "val_read", "report")
 N_V20_TRAIN_CONFIGS = 10
-V20_COLUMNS = ["event_id", "X_track", "X_cluster", "ytarget_track", "ytarget_cluster", "genmet", "genjet", "targetjet", "gen_target"]
+V20_COLUMNS = [
+    "event_id",
+    "X_track",
+    "X_cluster",
+    "ytarget_track",
+    "ytarget_cluster",
+    "genmet",
+    "genjet",
+    "targetjet",
+    "gen_target",
+    "gen_target_track",
+    "X_hit_calo",
+    "hit_to_cluster",
+    "calo_frac_hit",
+    "calo_frac_target",
+    "calo_frac",
+    "X_hit_offtrack",
+    "offtrack_target",
+    "offtrack_own",
+]
+N_OFFTRACK_FEATURES = 11  # postprocessing.OFFTRACK_FEATURES
 
 
 def _in_range(ids, entry):
@@ -277,8 +297,62 @@ def split_sample_v20(path, config, layout):
     return {s: generate_examples_v20(fs) for s, fs in files.items()}
 
 
+def v20_element_extras(n_track, X_hit_calo, hit_to_cluster, frac_hit, frac_target, frac, n_cluster):
+    """Per-element fields on the X axis (n_track tracks, then one row per cluster).
+
+    X_time_layer: (time, layer) of the cluster's most energetic calorimeter hit (ties: lowest hit row), 0 for tracks.
+    frac_elem, frac_target, frac: per (element, gen_target row), the energy-weighted mean of the hit fractions over the
+    cluster's hits. Hits in no cluster are dropped.
+    """
+    X_hit_calo = np.asarray(X_hit_calo, dtype=np.float32).reshape(-1, 15)
+    c = np.asarray(hit_to_cluster, dtype=np.int64)
+    tl = np.zeros((n_track + n_cluster, 2), dtype=np.float32)
+    inc = np.flatnonzero(c >= 0)
+    if len(inc):
+        srt = inc[np.lexsort((inc, -X_hit_calo[inc, 5], c[inc]))]
+        first = np.ones(len(srt), dtype=bool)
+        first[1:] = c[srt][1:] != c[srt][:-1]
+        seed = srt[first]
+        tl[n_track + c[seed]] = X_hit_calo[seed][:, [9, 14]]
+    frac_hit, frac_target = np.asarray(frac_hit, np.int64), np.asarray(frac_target, np.int64)
+    m = c[frac_hit] >= 0 if len(frac_hit) else np.zeros(0, dtype=bool)
+    out = (np.zeros(0, np.int32), np.zeros(0, np.int32), np.zeros(0, np.float32))
+    if m.any():
+        energy = X_hit_calo[:, 5].astype(np.float64)
+        total = np.bincount(c[inc], weights=energy[inc], minlength=n_cluster)
+        cl, tgt = c[frac_hit[m]], frac_target[m]
+        n_gen = int(tgt.max()) + 1
+        key, inv = np.unique(cl * n_gen + tgt, return_inverse=True)
+        share = np.bincount(inv, weights=energy[frac_hit[m]] * np.asarray(frac, np.float64)[m], minlength=len(key))
+        cl, tgt = key // n_gen, key % n_gen
+        keep = total[cl] > 0
+        out = ((n_track + cl[keep]).astype(np.int32), tgt[keep].astype(np.int32), (share[keep] / total[cl[keep]]).astype(np.float32))
+    return tl, *out
+
+
+def _v20_record_extras(ret, n_track, n_elements):
+    """The per-element and off-track fields of event 0 of an awkward batch."""
+    col = {k: ak.to_numpy(ret[k][0]) for k in ("X_hit_calo", "hit_to_cluster", "calo_frac_hit", "calo_frac_target", "calo_frac")}
+    tl, frac_elem, frac_target, frac = v20_element_extras(
+        n_track, col["X_hit_calo"], col["hit_to_cluster"], col["calo_frac_hit"], col["calo_frac_target"], col["calo_frac"], n_elements - n_track
+    )
+    X_off = np.asarray(ak.to_numpy(ret["X_hit_offtrack"][0]), np.float32)
+    if X_off.ndim != 2 or X_off.shape[1] != N_OFFTRACK_FEATURES:
+        raise ValueError(f"X_hit_offtrack has shape {X_off.shape}, expected (n, {N_OFFTRACK_FEATURES})")
+    return {
+        "X_time_layer": tl,
+        "frac_elem": frac_elem,
+        "frac_target": frac_target,
+        "frac": frac,
+        "X_offtrack": X_off,
+        "offtrack_target": np.asarray(ak.to_numpy(ret["offtrack_target"][0])).astype(np.int32),
+        "offtrack_own": np.asarray(ak.to_numpy(ret["offtrack_own"][0])).astype(np.int32),
+        "extras_stored": np.int32(1),
+    }
+
+
 def generate_examples_v20(files: List[Path]):
-    """Like generate_examples, plus event_id and gen_target, reading one event at a time."""
+    """Like generate_examples, plus event_id, gen_target and the per-element fields, reading one event at a time."""
     for fi in files:
         pf = pq.ParquetFile(fi, pre_buffer=False, buffer_size=1 << 20)
         missing = set(V20_COLUMNS) - set(pf.schema_arrow.names)
@@ -292,6 +366,10 @@ def generate_examples_v20(files: List[Path]):
             event_id = int(np.asarray(ak.to_numpy(ret["event_id"][0])).reshape(-1)[0])
             gen = np.array(_normalize_matrix(ak.to_numpy(ret["gen_target"][0]), 10), dtype=np.float32)
             gen[:, 0] = _remap_labels(gen[:, 0])
+            gen_track = np.asarray(ak.to_numpy(ret["gen_target_track"][0])).astype(np.int32)
+            if gen_track.shape != (len(gen),):
+                raise ValueError(f"{fi} event {event_id}: gen_target_track has shape {gen_track.shape}, gen_target {gen.shape}")
+            extras = _v20_record_extras(ret, len(ak.to_numpy(ret["X_track"][0])), len(rec["X"]))
             yield (
                 event_id,
                 {
@@ -303,5 +381,7 @@ def generate_examples_v20(files: List[Path]):
                     "targetjets": rec["targetjets"].astype(np.float32),
                     "event_id": np.int64(event_id),
                     "gen_target": gen,
+                    "gen_target_track": gen_track,
+                    **extras,
                 },
             )

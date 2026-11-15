@@ -11,7 +11,7 @@ PU0_SPLITS = ["train:0-7679:90", "val:7680-8959:10", "report:8960-10239:10"]
 L = U.V20_PU0_LAYOUT
 
 
-def _rec(eid, rng, n_trk=2, n_cl=3, n_gen=4):
+def _rec(eid, rng, n_trk=2, n_cl=3, n_gen=4, n_hits=5, n_off=2):
     """A record with the converter's keys and widths."""
     f32 = np.float32
     yt, yc = rng.random((n_trk, 14)).astype(f32), rng.random((n_cl, 14)).astype(f32)
@@ -30,6 +30,15 @@ def _rec(eid, rng, n_trk=2, n_cl=3, n_gen=4):
         "genjet": rng.random((nj, 4)).astype(f32),
         "targetjet": rng.random((nj, 4)).astype(f32),
         "gen_target": gen,
+        "gen_target_track": rng.integers(-1, max(n_trk, 1), n_gen).astype(np.int64),
+        "X_hit_calo": rng.random((n_hits, 15)).astype(f32),
+        "hit_to_cluster": rng.integers(-1, max(n_cl, 1), n_hits).astype(np.int64),
+        "calo_frac_hit": np.arange(n_hits, dtype=np.int32) if n_gen else np.zeros(0, np.int32),
+        "calo_frac_target": (np.arange(n_hits) % max(n_gen, 1)).astype(np.int32) if n_gen else np.zeros(0, np.int32),
+        "calo_frac": np.full(n_hits if n_gen else 0, 0.5, f32),
+        "X_hit_offtrack": rng.random((n_off, 11)).astype(f32),
+        "offtrack_target": rng.integers(-1, max(n_gen, 1), n_off).astype(np.int32),
+        "offtrack_own": rng.integers(-1, max(n_gen, 1), n_off).astype(np.int32),
         "genmet_withpu": f32(rng.random() * 50),
         "genjet_withpu": rng.random((nj, 4)).astype(f32),
         "pufrac_track": rng.random(n_trk).astype(f32),
@@ -46,7 +55,7 @@ def _write(path, events, drop=(), row_group_size=2):
 def _events(ids, seed=0):
     rng = np.random.default_rng(seed)
     evs = [_rec(e, rng) for e in ids]
-    evs[1] = _rec(ids[1], rng, n_trk=0, n_cl=0, n_gen=0)
+    evs[1] = _rec(ids[1], rng, n_trk=0, n_cl=0, n_gen=0, n_hits=0, n_off=0)
     return evs
 
 
@@ -83,9 +92,73 @@ def test_gen_target(tmp_path):
 
 
 def test_missing_gen_target(tmp_path):
-    fn = _write(tmp_path / "a.parquet", _events(range(3)), drop=("gen_target",))
-    with pytest.raises(KeyError, match="gen_target"):
-        list(U.generate_examples_v20([fn]))
+    for column in ("gen_target", "gen_target_track", "offtrack_own"):
+        fn = _write(tmp_path / "a.parquet", _events(range(3)), drop=(column,))
+        with pytest.raises(KeyError, match=column):
+            list(U.generate_examples_v20([fn]))
+
+
+def test_element_extras():
+    X = np.zeros((5, 15), np.float32)
+    X[:, 5] = [1.0, 3.0, 2.0, 2.0, 0.5]
+    X[:, 9] = [0.1, 0.2, 0.3, 0.4, 0.5]
+    X[:, 14] = [4, 5, 6, 7, 8]
+    h2c = np.array([0, 0, 1, 1, -1])  # cluster 1: two hits tied in energy, the lower row is the seed
+    hit = np.array([0, 0, 1, 2, 3, 4], np.int32)
+    tgt = np.array([0, 2, 2, 5, 2, 0], np.int32)
+    frac = np.array([0.5, 0.5, 1.0, 0.3, 0.6, 1.0], np.float32)
+    tl, fe, ft, f = U.v20_element_extras(2, X, h2c, hit, tgt, frac, n_cluster=2)
+    assert tl.tolist() == [[0, 0], [0, 0], [pytest.approx(0.2), 5], [pytest.approx(0.3), 6]]
+    got = {(e, t): v for e, t, v in zip(fe.tolist(), ft.tolist(), f.tolist())}
+    want = {(2, 0): 0.5 / 4, (2, 2): (0.5 + 3.0) / 4, (3, 2): 1.2 / 4, (3, 5): 0.6 / 4}
+    assert got.keys() == want.keys() and all(got[k] == pytest.approx(v) for k, v in want.items())
+    # one-hit elements carry the hit fractions unchanged
+    tl, fe, ft, f = U.v20_element_extras(1, X, np.array([0, 1, 2, 3, -1]), hit, tgt, frac, n_cluster=4)
+    assert fe.tolist() == [1, 1, 2, 3, 4] and ft.tolist() == [0, 2, 2, 5, 2] and f.tobytes() == frac[:5].tobytes()
+
+
+# feature spec of the 1.2.0 datasets: name -> (shape, dtype)
+FEATURES_1_2_0 = {
+    "X": ((None, 17), "float32"),
+    "ytarget": ((None, 14), "float32"),
+    "ycand": ((None, 14), "float32"),
+    "genmet": ((), "float32"),
+    "genjets": ((None, 4), "float32"),
+    "targetjets": ((None, 4), "float32"),
+    "event_id": ((), "int64"),
+    "gen_target": ((None, 10), "float32"),
+    "gen_target_track": ((None,), "int32"),
+    "X_time_layer": ((None, 2), "float32"),
+    "frac_elem": ((None,), "int32"),
+    "frac_target": ((None,), "int32"),
+    "frac": ((None,), "float32"),
+    "X_offtrack": ((None, 11), "float32"),
+    "offtrack_target": ((None,), "int32"),
+    "offtrack_own": ((None,), "int32"),
+    "extras_stored": ((), "int32"),
+}
+BUILDERS = [("ttbar_pu0_v20", "CollidermlTtbarPu0V20Pf", "colliderml_ttbar_pu0_v20_pf", "1")]
+
+
+@pytest.mark.parametrize("module,cls,name,config", BUILDERS)
+def test_feature_spec_is_1_2_0(tmp_path, module, cls, name, config):
+    import importlib
+
+    pytest.importorskip("tensorflow_datasets")
+    builder = getattr(importlib.import_module(f"mlpf.heptfds.colliderml_pf.{module}"), cls)(data_dir=str(tmp_path), config=config)
+    assert builder.name == name and str(builder.version) == "1.2.0"
+    got = {k: (tuple(v.shape), np.dtype(v.np_dtype).name) for k, v in builder.info.features.items()}
+    assert got == FEATURES_1_2_0
+
+
+def test_records_match_the_feature_spec(tmp_path):
+    out = list(U.generate_examples_v20([_write(tmp_path / "a.parquet", _events(range(4)))]))
+    for _, rec in out:
+        assert set(rec) == set(FEATURES_1_2_0)
+        for k, (shape, dtype) in FEATURES_1_2_0.items():
+            v = np.asarray(rec[k])
+            assert v.ndim == len(shape) and (k == "genmet" or v.dtype.name == dtype), k
+            assert all(a is None or a == b for a, b in zip(shape, v.shape)), k
 
 
 def _layout_files(tmp_path, specs=PU0_SPLITS, seed=0):
@@ -183,4 +256,5 @@ def test_tfds_build(tmp_path):
     assert ids == list(range(9088, 9216))
     r = ds[0]
     assert r["gen_target"].shape == (2, 10) and r["X"].shape == (2, 17)
+    assert r["X_time_layer"].shape == (2, 2) and r["X_offtrack"].shape == (2, 11) and r["extras_stored"] == 1
     assert set(r["gen_target"][:, 0].tolist()) <= {1.0, 2.0, 3.0, 4.0, 5.0}
