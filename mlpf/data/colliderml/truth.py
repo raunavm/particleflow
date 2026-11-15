@@ -315,6 +315,21 @@ def build_leaf_maps(particles_ev: Dict[str, Any], calo_ev: Dict[str, Any], track
     return pid, pdg, parent, is_leaf | surrogate, redirect, surrogate
 
 
+def own_hit_targets(tracker_ev: Dict[str, Any], particles_ev: Dict[str, Any], target_rows: np.ndarray) -> np.ndarray:
+    """Per tracker hit, the target (index into gen_features, whose particle-table rows are target_rows) whose own particle
+    made it, not walked to a leaf, or -1."""
+    hit_pid = np.asarray(ak.to_numpy(tracker_ev["particle_id"])).astype(np.int64)
+    target_pid = np.asarray(ak.to_numpy(particles_ev["particle_id"])).astype(np.int64)[np.asarray(target_rows, dtype=np.int64)]
+    out = np.full(len(hit_pid), -1, dtype=np.int64)
+    if len(target_pid) == 0:
+        return out
+    order = np.argsort(target_pid, kind="stable")
+    pos = np.clip(np.searchsorted(target_pid[order], hit_pid), 0, len(order) - 1)
+    hit = target_pid[order[pos]] == hit_pid
+    out[hit] = order[pos[hit]]
+    return out
+
+
 def calibration_factors(detector: np.ndarray, calibration: Dict[int, float]) -> np.ndarray:
     """Per-hit float32 calibration factor for an array of calo region codes.
 

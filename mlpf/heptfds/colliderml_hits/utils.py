@@ -9,7 +9,12 @@ from mlpf.heptfds.edm4hep_utils.utils_hits import generate_examples as _generate
 
 
 def generate_examples(files):
-    yield from _generate_examples(files, Dataset.COLLIDERML_HITS)
+    # the hits view keeps calorimeter hit time (col 9) and layer (col 14) at zero
+    for key, rec in _generate_examples(files, Dataset.COLLIDERML_HITS):
+        calo = rec["X"][:, 0] == 2
+        rec["X"][calo, 9] = 0.0
+        rec["X"][calo, 14] = 0.0
+        yield key, rec
 
 
 def split_sample(path, builder_config, num_splits=NUM_SPLITS):

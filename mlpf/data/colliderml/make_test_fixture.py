@@ -107,6 +107,7 @@ def _event_arrays(rng: np.random.Generator, iev: int):
     tracker_rows = {
         k: [] for k in ["x", "y", "z", "true_x", "true_y", "true_z", "time", "particle_id", "detector", "volume_id", "layer_id", "surface_id"]
     }
+    tracker_rows.update({k: [] for k in ("var_loc0", "var_loc1", "size_loc0", "size_loc1")})
     tid = 0
     prev_lid = None
     for leaf in leaves:
@@ -134,6 +135,10 @@ def _event_arrays(rng: np.random.Generator, iev: int):
                 tracker_rows["volume_id"].append(1)
                 tracker_rows["layer_id"].append(ih)
                 tracker_rows["surface_id"].append(tid)
+                tracker_rows["var_loc0"].append(2.5e-4)
+                tracker_rows["var_loc1"].append(0.0 if ih % 2 else 1.6e-4)  # odd layers: 1-D strips
+                tracker_rows["size_loc0"].append(1 + ih)
+                tracker_rows["size_loc1"].append(1)
                 hit_ids.append(len(tracker_rows["x"]) - 1)
             track_rows["hit_ids"].append(hit_ids)
             track_rows["track_id"].append(tid)
@@ -252,6 +257,10 @@ def write_shard(out_root: Path, shard_idx: int, n_shards: int, rng: np.random.Ge
         "volume_id": pa.array([e[3]["volume_id"] for e in evs], type=pa.list_(pa.uint8())),
         "layer_id": pa.array([e[3]["layer_id"] for e in evs], type=pa.list_(pa.uint16())),
         "surface_id": pa.array([e[3]["surface_id"] for e in evs], type=pa.list_(pa.uint32())),
+        "var_loc0": pa.array([e[3]["var_loc0"] for e in evs], type=pa.list_(pa.float32())),
+        "var_loc1": pa.array([e[3]["var_loc1"] for e in evs], type=pa.list_(pa.float32())),
+        "size_loc0": pa.array([e[3]["size_loc0"] for e in evs], type=pa.list_(pa.uint16())),
+        "size_loc1": pa.array([e[3]["size_loc1"] for e in evs], type=pa.list_(pa.uint16())),
     }
     tables = {"particles": pa.table(p_tab), "tracks": pa.table(t_tab), "calo_hits": pa.table(c_tab), "tracker_hits": pa.table(th_tab)}
     for obj, tbl in tables.items():

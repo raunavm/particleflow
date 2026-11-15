@@ -9,6 +9,10 @@
 #   genmet_withpu, genjet_withpu        (gen reference including pileup)
 #   pufrac_track, pufrac_cluster        (truth pileup fraction of every track / cluster)
 #   gen_target                          (visible truth particles before the allocator, GEN_TARGET_ORDER)
+#   gen_target_track                    (per gen_target row, the track it owns the most hits of, -1 if none)
+#   calo_frac_hit, calo_frac_target, calo_frac   (per (calo hit, gen_target row) truth energy fractions)
+#   X_hit_offtrack, offtrack_hit, offtrack_target, offtrack_own   (tracker hits on no track)
+# X_hit_calo carries the cell time (col 9) and layer (col 14) when the source has them.
 # genmet/genjet are clustered from the hard-scatter part of the *measurable truth* set
 # (pre-visibility, pre-allocator, see truth.py genref_features), genmet_withpu/genjet_withpu from
 # all of it; targetjet from the ytarget representatives.
@@ -38,7 +42,13 @@ from mlpf.conf import EDM4HEP
 from mlpf.data.colliderml.clustering import cluster_event
 from mlpf.data.colliderml.reader import iter_event_records, n_shard_events, shard_paths
 from mlpf.data.colliderml.tracks import track_features_cml
-from mlpf.data.colliderml.truth import DEFAULT_CALIBRATION, calibration_factors, compute_gen_tables
+from mlpf.data.colliderml.truth import (
+    DEFAULT_CALIBRATION,
+    TRACK_HIT_FRACTION_MIN,
+    calibration_factors,
+    compute_gen_tables,
+    own_hit_targets,
+)
 from mlpf.data.target_building import (
     EventData,
     assign_genparticles_to_obj_and_merge,
@@ -86,6 +96,81 @@ _hit_feature_order = EDM4HEP.HitFeatures.get_names()  # 15 names
 # gen_target: the visible truth particles before the allocator. They do not depend on the clustering, so one
 # target list scores reconstructions with different elements. The class is the particle's own, not its element's.
 GEN_TARGET_ORDER = ["cls", "charge", "pt", "eta", "sin_phi", "cos_phi", "energy", "ispu", "gp_to_track", "gp_to_cluster"]
+# layer field of the DD4hep calorimeter cell id (ODD readout system:8,barrel:3,module:4,stave:1,layer:6,...)
+CELL_LAYER_SHIFT, CELL_LAYER_MASK = 16, 0x3F
+# X_hit_offtrack columns: position [mm], time [ns], ACTS geometry ids, measurement variances [mm^2] and cluster sizes
+OFFTRACK_FEATURES = ["x", "y", "z", "time", "detector", "volume_id", "layer_id", "var_loc0", "var_loc1", "size_loc0", "size_loc1"]
+
+
+def cell_layer(cell_id) -> np.ndarray:
+    """Layer field of 64-bit DD4hep calorimeter cell ids, signed or unsigned."""
+    a = np.asarray(cell_id)
+    if a.dtype.kind not in "iu" or a.dtype.itemsize != 8:
+        raise ValueError(f"cell_id dtype {a.dtype}: expected a 64-bit integer")
+    u = a.view(np.uint64) if a.dtype.kind == "i" else a
+    return ((u >> np.uint64(CELL_LAYER_SHIFT)) & np.uint64(CELL_LAYER_MASK)).astype(np.int64)
+
+
+def _calo_truth_fractions(calo_ev, hit_det: np.ndarray, gp_to_hit, n_hit: int):
+    """(hit row, gen_target row, fraction) for every calorimeter hit and target with a nonzero share.
+
+    The fraction is the target's calibrated contributions to the hit over all of the hit's calibrated contributions, so a
+    hit's fractions sum to its visible share (at most 1).
+    """
+    rows, cols, w = (np.asarray(a) for a in gp_to_hit)
+    m = cols < n_hit  # gp_to_hit also holds zero-weight tracker-hit links at n_hit + tracker row
+    rows, cols, w = rows[m].astype(np.int64), cols[m].astype(np.int64), w[m].astype(np.float64)
+    empty = (np.zeros(0, np.int32), np.zeros(0, np.int32), np.zeros(0, np.float32))
+    if len(rows) == 0:
+        return empty
+    nctr = np.asarray(ak.to_numpy(ak.num(calo_ev["contrib_energies"]))).ravel()
+    ce = np.asarray(ak.to_numpy(ak.flatten(calo_ev["contrib_energies"], axis=None))).ravel().astype(np.float32, copy=False)
+    calibrated = ce * calibration_factors(np.repeat(hit_det, nctr), DEFAULT_CALIBRATION)
+    total = np.bincount(np.repeat(np.arange(n_hit), nctr), weights=calibrated.astype(np.float64), minlength=n_hit)
+    n_gen = int(rows.max()) + 1
+    key, inv = np.unique(cols * n_gen + rows, return_inverse=True)
+    share = np.bincount(inv, weights=w, minlength=len(key))
+    hit, gen = key // n_gen, key % n_gen
+    keep = (share > 0) & (total[hit] > 0)
+    if not keep.any():
+        return empty
+    hit, gen = hit[keep], gen[keep]
+    return hit.astype(np.int32), gen.astype(np.int32), (share[keep] / total[hit]).astype(np.float32)
+
+
+def _ev_field(ev, name: str, n: int) -> np.ndarray:
+    """A per-hit field as float32, zeros when the source table has no such column."""
+    return np.asarray(ak.to_numpy(ev[name]), dtype=np.float32) if name in ev.fields else np.zeros(n, dtype=np.float32)
+
+
+def _offtrack_hits(tracks_ev, tracker_ev, gp_to_hit, n_hit: int, n_tracker: int):
+    """Tracker hits that no track lists: (X_hit_offtrack, tracker-hit row, gen_target row of the hit's particle or -1)."""
+    hit_ids = np.asarray(ak.to_numpy(ak.flatten(tracks_ev["hit_ids"], axis=None)), dtype=np.int64)
+    on_track = np.zeros(n_tracker, dtype=bool)
+    on_track[hit_ids[(hit_ids >= 0) & (hit_ids < n_tracker)]] = True
+    off = np.flatnonzero(~on_track)
+    rows, cols = (np.asarray(a, dtype=np.int64) for a in gp_to_hit[:2])
+    target = np.full(n_tracker, -1, dtype=np.int32)
+    m = cols >= n_hit  # zero-weight tracker-hit links, at most one target per hit
+    target[cols[m] - n_hit] = rows[m]
+    X = np.zeros((len(off), len(OFFTRACK_FEATURES)), dtype=np.float32)
+    for j, k in enumerate(OFFTRACK_FEATURES):
+        X[:, j] = _ev_field(tracker_ev, k, n_tracker)[off]
+    return X, off.astype(np.int32), target[off]
+
+
+def _gen_target_track(gp_to_track, n_gen: int) -> np.ndarray:
+    """Per gen_target row, the track it owns the largest hit fraction of (lowest index on ties), -1 below TRACK_HIT_FRACTION_MIN."""
+    out = np.full(n_gen, -1, dtype=np.int64)
+    rows, cols, w = (np.asarray(a) for a in gp_to_track)
+    if len(rows):
+        keep = w >= TRACK_HIT_FRACTION_MIN
+        rows, cols, w = rows[keep], cols[keep], w[keep]
+    if len(rows):
+        order = np.lexsort((cols, -w.astype(np.float64), rows))
+        first = np.unique(rows[order], return_index=True)[1]
+        out[rows[order][first].astype(np.int64)] = cols[order][first]
+    return out
 
 
 def _gen_target_rows(gen_features) -> np.ndarray:
@@ -218,8 +303,8 @@ def _event_record_one(
     n_track = len(ak.to_numpy(tracks_ev["d0"]))
 
     # -- truth + attribution -------------------------------------------------
-    gen_features, gp_to_hit, gp_to_track, genref_features = compute_gen_tables(
-        particles_ev, calo_ev, tracks_ev, DEFAULT_CALIBRATION, tracker_ev=tracker_ev
+    gen_features, gp_to_hit, gp_to_track, genref_features, target_rows = compute_gen_tables(
+        particles_ev, calo_ev, tracks_ev, DEFAULT_CALIBRATION, tracker_ev=tracker_ev, return_rows=True
     )
     if all_pileup:
         gen_features["ispu"] = np.ones_like(gen_features["ispu"])
@@ -263,6 +348,10 @@ def _event_record_one(
     # zero-weight tracker links with hit index offset by n_hit); the feature filler just needs
     # that total length.
     n_tracker = len(ak.to_numpy(tracker_ev["x"]))
+    # truth fractions and off-track hits, from the truth tables before the allocator sees them
+    calo_frac_hit, calo_frac_target, calo_frac = _calo_truth_fractions(calo_ev, hit_det, gp_to_hit, n_hit)
+    X_hit_offtrack, offtrack_hit, offtrack_target = _offtrack_hits(tracks_ev, tracker_ev, gp_to_hit, n_hit, n_tracker)
+    offtrack_own = own_hit_targets(tracker_ev, particles_ev, target_rows)[offtrack_hit].astype(np.int32)
     gpdata = EventData(
         gen_features,
         {"type": np.zeros(n_hit + n_tracker, dtype=np.float32)},  # filler; only the length is read
@@ -399,8 +488,9 @@ def _event_record_one(
 
     # -- calo-hit view -----------------------------------------------------------
     # X_hit_calo rows follow EDM4hep hit layout:
-    #   [ elemtype(2), et, eta, sin_phi, cos_phi, energy(=calibrated total_energy), x, y, z, time(0),
-    #     subdetector(=region), type(0), system(0), side(0), layer(0) ]
+    #   [ elemtype(2), et, eta, sin_phi, cos_phi, energy(=calibrated total_energy), x, y, z, time(cell time, ns),
+    #     subdetector(=region), type(0), system(0), side(0), layer(cell_layer of cell_id) ]
+    # time and layer are 0 when the source table has no time / cell_id column (Release 1).
     # ytarget_hit_calo rows use the canonical particle_feature_order layout with:
     #   * exactly one full-target (exclusive) row per truth particle on its max-deposit
     #     attributed hit (via the allocator's gp_to_hit_idx; key4hep parity), and
@@ -421,9 +511,11 @@ def _event_record_one(
     X_hit_calo[:, 6] = hit_x
     X_hit_calo[:, 7] = hit_y
     X_hit_calo[:, 8] = hit_z
-    X_hit_calo[:, 9] = 0.0  # time placeholder
+    X_hit_calo[:, 9] = _ev_field(calo_ev, "time", n_hit)
     X_hit_calo[:, 10] = hit_det.astype(np.float32)
     X_hit_calo[:, 11] = 0.0
+    if "cell_id" in calo_ev.fields:
+        X_hit_calo[:, 14] = cell_layer(ak.to_numpy(calo_ev["cell_id"])).astype(np.float32)
 
     ytarget_hit_calo = np.zeros((n_hit, len(particle_feature_order)), dtype=np.float32)
     # inclusive: a calo hit carries the particle_number of its largest contributor, if that
@@ -563,6 +655,14 @@ def _event_record_one(
         "pufrac_track": pufrac_track,
         "pufrac_cluster": pufrac_cluster,
         "gen_target": _gen_target_rows(gen_features),
+        "gen_target_track": _gen_target_track(gp_to_track, len(gen_features["PDG"])),
+        "calo_frac_hit": calo_frac_hit,
+        "calo_frac_target": calo_frac_target,
+        "calo_frac": calo_frac,
+        "X_hit_offtrack": X_hit_offtrack,
+        "offtrack_hit": offtrack_hit,
+        "offtrack_target": offtrack_target,
+        "offtrack_own": offtrack_own,
     }
 
 
@@ -619,10 +719,16 @@ def _forward_truth_tag() -> bytes:
     return f"drop-eta{truth.OUT_OF_ACCEPTANCE_ABS_ETA:g}-v1".encode() if truth.drop_out_of_acceptance else b"none-v1"
 
 
+def _offtrack_features_tag() -> bytes:
+    """Parquet metadata value recording the X_hit_offtrack columns."""
+    return ",".join(OFFTRACK_FEATURES).encode()
+
+
 def _parquet_usable(ofn: Path, expected_rows: int | None = None, assignment: str = DEFAULT_ASSIGNMENT) -> bool:
     """Check current target metadata, readability and the expected event count.
 
-    Outputs predating pileup truth or the out-of-acceptance truth handling, legacy greedy outputs, corrupted
+    Outputs predating pileup truth, the out-of-acceptance truth handling or the current X_hit_offtrack columns,
+    legacy greedy outputs, corrupted
     writes and partial --num-events outputs must be reconverted rather than skipped by resume.
     """
     if not os.path.isfile(ofn):
@@ -637,6 +743,8 @@ def _parquet_usable(ofn: Path, expected_rows: int | None = None, assignment: str
             return False
         if (metadata.metadata or {}).get(b"mlpf.forward_truth") != _forward_truth_tag():
             return False
+        if (metadata.metadata or {}).get(b"mlpf.offtrack_features") != _offtrack_features_tag():
+            return False
         n_rows = metadata.num_rows
     except Exception:
         return False
@@ -647,6 +755,18 @@ def _shard_done(ofn: Path, source_fns: List[Path], assignment: str = DEFAULT_ASS
     """A full-shard output is done iff it is readable and holds every source event present in
     all four tables (the reader drops the rare event missing from one)."""
     return _parquet_usable(ofn, expected_rows=n_shard_events(source_fns), assignment=assignment)
+
+
+def _check_rebuild_columns(calo_fn: Path, tracker_fn: Path) -> None:
+    """Raise if a v20 adapter output (calo_hits with pandora_cluster) lacks the columns of the time, layer and off-track fields."""
+    import pyarrow.parquet as pq
+
+    calo = set(pq.read_schema(calo_fn).names)
+    if "pandora_cluster" not in calo:
+        return
+    missing = ({"time", "cell_id"} - calo) | (set(OFFTRACK_FEATURES) - set(pq.read_schema(tracker_fn).names))
+    if missing:
+        raise KeyError(f"{calo_fn.name}: v20 adapter output without {sorted(missing)}")
 
 
 def process_one_file(
@@ -667,6 +787,7 @@ def process_one_file(
     all_pileup: bool = False,
 ) -> None:
     source_fns = [particles_fn, tracks_fn, calo_fn, tracker_fn]
+    _check_rebuild_columns(calo_fn, tracker_fn)
     if num_events == -1 and _shard_done(ofn, source_fns, assignment):
         print(f"[shard {shard_index + 1}/{job_total_shards}] {Path(ofn).name} already exists, skipping")
         return
@@ -712,6 +833,7 @@ def process_one_file(
                     b"mlpf.target_assignment": _assignment_tag(assignment),
                     b"mlpf.pileup_truth": b"energy-fraction-v1",
                     b"mlpf.forward_truth": _forward_truth_tag(),
+                    b"mlpf.offtrack_features": _offtrack_features_tag(),
                 }
             )
             if writer is None:
