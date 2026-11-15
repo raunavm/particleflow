@@ -179,3 +179,33 @@ def test_local_max_seeds_fill_every_slot():
         assert (seeds >= 0).all() and len(set(seeds.tolist())) == 24
     with pytest.raises(ValueError, match="calo_seed_local_max_radius"):
         SetDecoderConfig(calo_seed_local_max_radius=0.02)
+
+
+def test_no_pileup_head_by_default_and_outputs_stay_zero():
+    decoder = build_decoder()
+    assert decoder.pileup_head is None and not any("pileup" in k for k in decoder.state_dict())
+    X, mask, memory = make_inputs()
+    assert torch.equal(decoder(memory, mask, X)[3], torch.zeros(2, 6, 2))
+
+
+def test_pileup_loss_trains_the_head():
+    decoder = build_decoder(pileup_loss_weight=1.0)
+    X, mask, memory = make_inputs(batch_size=1, num_elements=8)
+    out = decoder(memory, mask, X)
+    targets = make_targets(num_targets=3, seed=9, ispu=torch.tensor([1.0, 0.0, 1.0]))
+    total, losses, _ = loss(targets, list(out.predictions), pileup_loss_weight=1.0)
+    assert losses["Pileup"] > 0
+    total.backward()
+    assert decoder.pileup_head.weight.grad.abs().sum() > 0
+
+
+def test_pileup_loss_is_zero_when_predicted_right():
+    targets = make_targets(batch_size=2, num_targets=3, seed=10)
+    raw = make_raw(2, 4)
+    with torch.no_grad():
+        raw[3][..., 0], raw[3][..., 1] = 60.0, -60.0
+    _, losses, _ = loss(targets, raw, pileup_loss_weight=1.0)
+    assert losses["Pileup"] == 0
+    targets[..., 7] = 1.0
+    _, losses, _ = loss(targets, raw, pileup_loss_weight=2.0)
+    torch.testing.assert_close(losses["Pileup"], torch.tensor(240.0))

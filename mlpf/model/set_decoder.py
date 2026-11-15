@@ -420,6 +420,7 @@ class ParticleSetDecoder(nn.Module):
 
         self.strict_seeding = config.strict_seeding
         self.calo_seed_local_max_radius = config.calo_seed_local_max_radius
+        self.pileup_head = nn.Linear(embedding_dim, 2) if config.pileup_loss_weight > 0 else None
         self.anchor_mode = config.anchor_mode
         self.anchor_eta_step = config.anchor_eta_step
         self.anchor_phi_bins = config.anchor_phi_bins
@@ -783,7 +784,7 @@ class ParticleSetDecoder(nn.Module):
             momentum = torch.cat((pt[..., None], momentum[..., 1:].float()), -1)
         if hit_energy is not None:
             momentum = self._readout_momentum(normalized_slots, pid, momentum, hit_energy, readout)
-        pileup = torch.zeros_like(presence)
+        pileup = self.pileup_head(normalized_slots) if self.pileup_head is not None else torch.zeros_like(presence)
         return presence, pid, momentum, pileup
 
     def _late_grouping(self, slots, memory):

@@ -409,6 +409,7 @@ def _set_loss_kwargs(model_module, raw_predictions):
         "seed_index": raw_predictions.seed_index,
         "is_anchor": raw_predictions.is_anchor,
         "strict_seeding": config.strict_seeding,
+        "pileup_loss_weight": config.pileup_loss_weight,
     }
 
 

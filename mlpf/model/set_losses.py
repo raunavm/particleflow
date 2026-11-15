@@ -130,8 +130,11 @@ def set_event_loss(
     momentum_loss="mse",
     momentum_huber_delta=0.2,
     presence_normalization="mean",
+    pileup_loss_weight=0.0,
 ):
     """Permutation-invariant particle-set loss for a padded event batch.
+
+    pileup_loss_weight > 0 adds "Pileup", the weighted cross-entropy of the pileup logits against the matched targets' ispu.
 
     presence_normalization: the presence loss is the weighted mean over the slots ("mean") or the weighted sum over the
     slots divided by their number ("num_slots").
@@ -179,7 +182,16 @@ def set_event_loss(
         losses["Classification"] = zero
         for feature in REGRESSION_FEATURES:
             losses[f"Regression_{feature}"] = zero
+        if pileup_loss_weight > 0:
+            losses["Pileup"] = predictions["ispu"].sum() * 0.0
         return losses, matches
+
+    if pileup_loss_weight > 0:
+        pileup_logits = torch.cat([predictions["ispu"][event_idx, slots] for event_idx, (slots, _) in enumerate(matches)])
+        pileup_targets = torch.cat(
+            [targets["ispu"][event_idx, target_mask[event_idx].bool()][target_indices] for event_idx, (_, target_indices) in enumerate(matches)]
+        )
+        losses["Pileup"] = pileup_loss_weight * F.cross_entropy(pileup_logits.float(), pileup_targets.long())
 
     matched_predictions = {key: torch.cat(value, dim=0) for key, value in matched_predictions.items()}
     matched_targets = {key: torch.cat(value, dim=0) for key, value in matched_targets.items()}
@@ -252,6 +264,7 @@ def set_mlpf_loss(
     seed_index=None,
     is_anchor=None,
     strict_seeding=False,
+    pileup_loss_weight=0.0,
 ):
     """Compute the set-prediction objective with the standard task names.
 
@@ -293,6 +306,7 @@ def set_mlpf_loss(
         momentum_loss=momentum_loss,
         momentum_huber_delta=momentum_huber_delta,
         presence_normalization=presence_normalization,
+        pileup_loss_weight=pileup_loss_weight,
     )
     task_losses = {task: losses[task] for task in LOSS_TASKS}
     if task_loss_weighter is None:
@@ -305,6 +319,8 @@ def set_mlpf_loss(
 
     if "Cardinality" in losses:
         loss_opt = loss_opt + losses["Cardinality"]
+    if "Pileup" in losses:
+        loss_opt = loss_opt + losses["Pileup"]
     losses.update(seed_diagnostics)
     if allow_unmatched_targets:
         total = batch.target_mask.sum()
@@ -377,6 +393,7 @@ def set_mlpf_loss(
                 momentum_huber_delta=momentum_huber_delta,
                 matches=matches,
                 presence_normalization=presence_normalization,
+                pileup_loss_weight=pileup_loss_weight,
             )
             auxiliary_losses.append(sum(layer_losses.values()))
         losses["Auxiliary"] = auxiliary_loss_weight * torch.stack(auxiliary_losses).mean()

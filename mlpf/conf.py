@@ -1072,6 +1072,8 @@ class SetDecoderConfig(BaseModel):
     anchor_phi_bins: int = Field(default=128, gt=0)
     anchor_eta_max: float = Field(default=4.5, gt=0.0)
     anchor_smoothing: float = Field(default=0.1, ge=0.0)
+    # > 0 adds a pileup head on the slots, trained by cross-entropy on the matched targets' ispu
+    pileup_loss_weight: float = Field(default=0.0, ge=0.0)
     # presence loss: weighted mean over the slots, or the weighted sum over the number of slots
     presence_normalization: Literal["mean", "num_slots"] = "mean"
     matcher: SetMatcherConfig = Field(default_factory=SetMatcherConfig)
