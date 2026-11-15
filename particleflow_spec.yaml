@@ -1586,3 +1586,121 @@ models:
         num_heads: 8
         ffn_multiplier: 4.0
         dropout: 0.0
+
+  # Set output on the ColliderML v20 ttbar sample without pileup, with gen_target targets. Every track and calorimeter
+  # element seeds a slot, the rest of the slots are energy anchors. The hit-to-slot assignment is read from the final
+  # slots, and a slot not seeded on a track takes its energy from the calorimeter energy assigned to it.
+  pyg-colliderml-pu0-v20-set-hits: &pyg_colliderml_pu0_v20_set_hits
+    <<: *defaults
+    dataset: colliderml
+    gpu_batch_multiplier: 1
+    ntest: 0
+    optimizer: adamw
+    gradient_clip_norm: 1.0
+    lr_schedule: onecycle
+    lr_schedule_config:
+      onecycle:
+        pct_start: 0.05
+    validation_diagnostics_batches: 8
+    set_target_source: gen_target
+    colliderml_data:
+      use_layer: true
+
+    hyperparameters:
+      batch_size: 8
+      lr: 0.0003
+
+    architecture: &pyg_colliderml_v20_set_hits_architecture
+      type: "attention"
+      input_encoding: "split"
+      output_mode: "set"
+      colliderml_input_features: true
+      attention:
+        attention_type: flash
+        num_convs: 3
+        head_dim: 16
+        num_heads: 16
+        use_jagged_attention: true
+      set_decoder: &v20_set_hits_decoder
+        num_slots: 2048
+        num_layers: 4
+        num_heads: 8
+        ffn_multiplier: 4.0
+        dropout: 0.0
+        query_init: input-conditioned
+        # the scale of each layer's reference step, not an attention radius
+        local_attention_radius: 0.4
+        attention_mode: global-flash
+        allow_unmatched_targets: true
+        strict_seeding: true
+        anchor_mode: fill_unseeded
+        presence_normalization: num_slots
+        matching_threads: 4
+        pileup_loss_weight: 1.0
+        hit_grouping: true
+        hit_grouping_dim: 64
+        hit_grouping_loss_weight: 1.0
+        hit_grouping_late: true
+        hit_grouping_energy_weighted: true
+        hit_energy_readout: true
+        hit_assignment_dice_cost: 2.0
+
+    train_datasets:
+      physical:
+        batch_size: 8
+        samples:
+          - name: "colliderml_ttbar_pu0_v20_pf"
+            version: "1.2.0"
+            splits: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
+
+    validation_datasets:
+      physical:
+        batch_size: 1
+        samples:
+          - name: "colliderml_ttbar_pu0_v20_pf"
+            version: "1.2.0"
+            splits: ["1"]
+
+    test_datasets:
+      - name: "colliderml_ttbar_pu0_v20_pf"
+        version: "1.2.0"
+        splits: ["r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"]
+
+  # The same with calorimeter slots seeded on local energy maxima and a Dice loss on the hit assignment.
+  pyg-colliderml-pu0-v20-set-hits-seedmax-dice:
+    <<: *pyg_colliderml_pu0_v20_set_hits
+    architecture:
+      <<: *pyg_colliderml_v20_set_hits_architecture
+      set_decoder:
+        <<: *v20_set_hits_decoder
+        calo_seed_local_max_radius: 0.02
+        hit_grouping_dice_loss_weight: 2.0
+
+  # The same model on the PU200 v22 blocks, trained on (eta, phi) crops of each event with host-class targets.
+  pyg-colliderml-pu200-v22-set-hits-crops:
+    <<: *pyg_colliderml_pu0_v20_set_hits
+    crop:
+      enabled: true
+    colliderml_data:
+      use_layer: true
+      host_class_targets: true
+
+    train_datasets:
+      physical:
+        batch_size: 8
+        samples:
+          - name: "colliderml_ttbar_pu200_v22_pf_blocks"
+            version: "1.2.0"
+            splits: ["e03200", "e03300", "e03400", "e03500", "e03600", "e03700", "e03800", "e03900", "e04000", "e04100", "e04200",
+                     "e04500", "e04600", "e04700", "e04800", "e04900", "e05000", "e05100", "e05200", "e05300", "e05400",
+                     "e05700", "e05800", "e05900", "e06000", "e06100", "e06200", "e06300"]
+
+    validation_datasets:
+      physical:
+        batch_size: 1
+        samples:
+          - name: "colliderml_ttbar_pu200_v22_pf_blocks"
+            version: "1.2.0"
+            splits: ["e05500", "e06400"]
+
+    test_datasets: []
