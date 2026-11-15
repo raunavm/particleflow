@@ -352,6 +352,20 @@ class TFDSDataSource:
         return "TFDSDataSource(ds={}, pad_to_multiple={})".format(self.ds.__repr__(), self.pad_to_multiple)
 
 
+# PU200 v22 blocks: one TFDS config eNNNNN per 100 events (NNNNN = first event id), each with a single train split
+PU200_BLOCKS = "colliderml_ttbar_pu200_v22_pf_blocks"
+PU200_HELD_OUT_IDS = ((768, 1663), (20000, 22999))  # evaluation events, never read in training
+
+
+def check_pu200_block(sample_name, block):
+    """Raise if a PU200 v22 block holds held-out event ids; other samples pass."""
+    if sample_name != PU200_BLOCKS:
+        return
+    first = int(block.lstrip("e"))
+    if any(first <= hi and first + 99 >= lo for lo, hi in PU200_HELD_OUT_IDS):
+        raise ValueError(f"{sample_name}/{block}: event ids {first}-{first + 99} overlap the held-out ids {PU200_HELD_OUT_IDS}")
+
+
 class PFDataset:
     """Builds a DataSource from tensorflow datasets."""
 
@@ -378,7 +392,8 @@ class PFDataset:
             split: "train" or "test" (if "valid" then will use "test")
         """
         if split == "valid":
-            split = "test"
+            # a PU200 v22 block holds one train split: its validation blocks are whole configs
+            split = "train" if name.startswith(PU200_BLOCKS + "/") else "test"
 
         try:
             builder = tfds.builder(name, data_dir=data_dir)
@@ -1024,6 +1039,7 @@ def get_interleaved_dataloaders(world_size, rank, config: MLPFConfig, use_cuda, 
                     nevents = max(1, n_split_val // len(split_configs_to_use))
 
                 for split_config in split_configs_to_use:
+                    check_pu200_block(sample_name, split_config)
                     ds = PFDataset(
                         config.data_dir_for(sample_name),
                         f"{sample_name}/{split_config}:{version}",

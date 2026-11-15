@@ -295,3 +295,13 @@ def test_model_step_on_a_crop_batch():
     assert torch.isfinite(total) and losses["AnchorSlots"] > 0 and raw.anchor_guard is not None
     total.backward()
     assert model.set_decoder.anchor_embedding.grad.abs().sum() > 0
+
+
+def test_pu200_blocks_refuse_held_out_ids():
+    from mlpf.model.PFDataset import check_pu200_block
+
+    check_pu200_block(DS_NAME, "e03200")
+    check_pu200_block("colliderml_ttbar_pu0_v20_pf", "1")
+    for block in ("e01600", "e20000", "e22900"):
+        with pytest.raises(ValueError, match="held-out"):
+            check_pu200_block(DS_NAME, block)
