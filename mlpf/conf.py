@@ -1497,6 +1497,8 @@ class MLPFConfig(BaseModel):
     lr: float = 0.0001
     weight_decay: float = 0.01
     optimizer: OptimizerType = OptimizerType.ADAMW
+    # global gradient-norm clip: LAMB's max_grad_norm, or clip_grad_norm_ before the AdamW step; not for SGD
+    gradient_clip_norm: Optional[float] = Field(default=None, gt=0.0)
     lr_schedule: LRSchedule = LRSchedule.COSINEDECAY
     lr_schedule_config: Dict[str, Any] = Field(default_factory=dict)
     task_loss_weights: TaskLossWeights = Field(default_factory=TaskLossWeights)
@@ -1628,6 +1630,12 @@ class MLPFConfig(BaseModel):
             if version is not None and versions.setdefault(dataset, version) != version:
                 raise ValueError(f"{dataset} samples have versions {versions[dataset]} and {version}")
         return versions
+
+    @model_validator(mode="after")
+    def validate_gradient_clip(self) -> "MLPFConfig":
+        if self.gradient_clip_norm is not None and self.optimizer == OptimizerType.SGD:
+            raise ValueError("gradient_clip_norm is implemented for LAMB and AdamW, not SGD")
+        return self
 
     @model_validator(mode="after")
     def validate_crops(self) -> "MLPFConfig":

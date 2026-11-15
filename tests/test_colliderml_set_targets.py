@@ -201,3 +201,12 @@ def test_host_class_flag_relabels_gen_target():
     assert off["gen_target"][:, 0].tolist() == [3, 3, 1, 4]
     assert on["gen_target"][:, 0].tolist() == [1, 3, 2, 3]
     assert on["ytarget_set"][:, 0].tolist() == [1, 3, 2, 3]
+
+
+def test_ntest_zero_skips_the_test_datasets():
+    from mlpf.model.training import _test_samples
+
+    cfg = _pf_config(test_dataset={DS_NAME: {"version": "1.2.0", "splits": ["r1"]}}, enabled_test_datasets=[DS_NAME])
+    assert _test_samples(cfg) == [DS_NAME]
+    cfg.ntest = 0
+    assert _test_samples(cfg) == []

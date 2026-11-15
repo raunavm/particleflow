@@ -99,7 +99,7 @@ from mlpf.model.set_losses import SetMatcherWeights, assignment_dice_costs, hung
 from mlpf.model.reconstruction_diagnostics import compute_hit_grouping_metrics
 from mlpf.model.validation_metrics import compute_set_slot_metrics, compute_validation_particle_metrics, validation_particle_collections
 from mlpf.utils import create_comet_experiment
-from mlpf.conf import INPUT_TYPE_LABELS, Dataset, MLPFConfig, OutputMode, SOURCE_LABELS, dataset_for_sample
+from mlpf.conf import INPUT_TYPE_LABELS, Dataset, MLPFConfig, OptimizerType, OutputMode, SOURCE_LABELS, dataset_for_sample
 from mlpf.jet_utils import get_jet_config
 
 from mlpf.model.benchmarking import active_benchmark, benchmark_phase, record_benchmark, record_phase
@@ -635,6 +635,7 @@ def train_step(
     dtype=torch.float32,
     scaler=None,
     loader_stats=None,
+    gradient_clip_norm=None,
 ):
     """Run one training step
 
@@ -651,6 +652,7 @@ def train_step(
         checkpoint_dir: Directory to save checkpoints
         device_type: 'cuda' or 'cpu'
         dtype: Torch dtype for computations
+        gradient_clip_norm: global gradient-norm clip before the optimizer step, None for none
 
     Returns:
         dict: Dictionary of step losses
@@ -736,6 +738,9 @@ def train_step(
     phase_start = _record_phase_time_if_enabled(diagnostics.get("time", {}), "backward", phase_start, device_type, log_this_step)
     if log_this_step:
         _collect_step_memory(rank, "after_backward", diagnostics)
+    if gradient_clip_norm is not None:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
 
     scaler.step(optimizer)
     scaler.update()
@@ -1371,7 +1376,7 @@ def _run_validation_cycle(
     testdir_name = f"_step_{step}"
     testing_start = time.perf_counter()
     log_memory("run_test_start", rank, tensorboard_writer_valid, step)
-    for sample in config.enabled_test_datasets:
+    for sample in _test_samples(config):
         run_test(rank, world_size, config, outdir, model, sample, testdir_name, dtype)
     log_memory("run_test_end", rank, tensorboard_writer_valid, step)
     testing_time = time.perf_counter() - testing_start
@@ -1380,7 +1385,7 @@ def _run_validation_cycle(
     plotting_start = time.perf_counter()
     if (rank == 0) or (rank == "cpu"):
         log_memory("make_plots_start", rank, tensorboard_writer_valid, step)
-        for sample in config.enabled_test_datasets:
+        for sample in _test_samples(config):
             with benchmark_phase("plotting", sample=sample):
                 plot_metrics = make_plots(outdir, sample, dataset_for_sample(sample, config.dataset), testdir_name, config.ntest)
             plot_metrics_sample[sample] = plot_metrics
@@ -1555,6 +1560,7 @@ def train_all_steps(
             scaler=scaler,
             loader_stats=train_loader.stats() if (log_this_step and tensorboard_writer_train is not None) else None,
             regression_weights=UNIT_REGRESSION_WEIGHTS,
+            gradient_clip_norm=config.gradient_clip_norm if config.optimizer == OptimizerType.ADAMW else None,
         )
         log_memory("train_step_end", rank, tensorboard_writer_train if log_this_step else None, step)
         model_forward_time = time.time() - model_forward_start
@@ -1677,6 +1683,14 @@ def train_all_steps(
     if (rank == 0) or (rank == "cpu"):
         tensorboard_writer_train.close()
         tensorboard_writer_valid.close()
+
+
+def _test_samples(config: MLPFConfig):
+    """The test datasets to run and plot; none with ntest = 0."""
+    if config.ntest == 0:
+        _logger.info("ntest=0: skipping the test datasets")
+        return []
+    return config.enabled_test_datasets
 
 
 @record_phase("testing")
@@ -2017,11 +2031,11 @@ def run(
     if not config.train and config.test:
         _logger.info("Entering test step block (train=False, test=True)")
         testdir_name = "_test"
-        for sample in config.enabled_test_datasets:
+        for sample in _test_samples(config):
             run_test(rank, world_size, config, outdir, model, sample, testdir_name, dtype)
 
         if (rank == 0) or (rank == "cpu"):
-            for sample in config.enabled_test_datasets:
+            for sample in _test_samples(config):
                 make_plots(outdir, sample, dataset_for_sample(sample, config.dataset), testdir_name, config.ntest)
 
     if world_size > 1:

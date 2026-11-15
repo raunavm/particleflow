@@ -22,7 +22,9 @@ def get_optimizer(model: torch.nn.Module, config: MLPFConfig):
     if config.optimizer == OptimizerType.ADAMW:
         ret = torch.optim.AdamW(parameters, lr=config.lr, weight_decay=wd)
     elif config.optimizer == OptimizerType.LAMB:
-        ret = Lamb(parameters, lr=config.lr, weight_decay=wd)
+        # gradient_clip_norm is LAMB's own global-norm clip, whose default is 1.0
+        clip = {} if config.gradient_clip_norm is None else {"max_grad_norm": config.gradient_clip_norm}
+        ret = Lamb(parameters, lr=config.lr, weight_decay=wd, **clip)
     elif config.optimizer == OptimizerType.SGD:
         ret = torch.optim.SGD(parameters, lr=config.lr, weight_decay=wd)
     else:

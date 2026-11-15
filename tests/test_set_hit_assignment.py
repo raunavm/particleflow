@@ -263,3 +263,37 @@ def test_dice_loss_reaches_the_assignment_and_the_model_step_reports_it():
     assert float(losses[2.0]["HitGrouping"]) == pytest.approx(float(losses[0.0]["HitGrouping"]), rel=1e-6)
     with pytest.raises(ValueError, match="require hit_grouping"):
         SetDecoderConfig(query_init="input-conditioned", hit_grouping_dice_loss_weight=2.0)
+
+
+def test_adamw_gradient_clip_in_train_step():
+    from mlpf.model.training import train_step
+
+    torch.manual_seed(0)
+    model = MLPF(mlpf_config(**LATE))
+    batch = model_batch()
+    norms = []
+
+    class RecordingAdamW(torch.optim.AdamW):
+        def step(self, closure=None):
+            norms.append(float(torch.linalg.vector_norm(torch.stack([p.grad.norm() for p in model.parameters() if p.grad is not None]))))
+            return super().step(closure)
+
+    optimizer = RecordingAdamW(model.parameters(), lr=1e-3)
+    scaler = torch.amp.GradScaler("cpu", enabled=False)
+    for clip, step in ((None, 1), (1e-3, 2)):
+        train_step("cpu", 1, model, optimizer, batch, None, step, REGRESSION_WEIGHTS, device_type="cpu", scaler=scaler, gradient_clip_norm=clip)
+    assert norms[0] > 1e-2 and norms[1] == pytest.approx(1e-3, rel=1e-3)
+
+
+def test_gradient_clip_is_lambs_max_grad_norm():
+    from types import SimpleNamespace
+
+    from mlpf.conf import OptimizerType
+    from mlpf.optimizers import get_optimizer
+
+    model = torch.nn.Linear(2, 2)
+    for clip, want in ((None, 1.0), (0.5, 0.5)):
+        config = SimpleNamespace(weight_decay=0.01, optimizer=OptimizerType.LAMB, lr=1e-3, gradient_clip_norm=clip)
+        assert get_optimizer(model, config).defaults["max_grad_norm"] == want
+    with pytest.raises(ValueError, match="not SGD"):
+        mlpf_config(**LATE).model_validate(dict(mlpf_config(**LATE).model_dump(), optimizer="sgd", gradient_clip_norm=1.0))
