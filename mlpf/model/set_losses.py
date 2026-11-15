@@ -131,8 +131,12 @@ def set_event_loss(
     momentum_huber_delta=0.2,
     presence_normalization="mean",
     pileup_loss_weight=0.0,
+    guard_slots=None,
 ):
     """Permutation-invariant particle-set loss for a padded event batch.
+
+    guard_slots: optional [batch, slots] bool, the slots seeded in a crop's guard band. Unmatched ones are left out of
+    the presence loss, since their particle may belong to a neighboring crop; matched ones are trained as usual.
 
     pileup_loss_weight > 0 adds "Pileup", the weighted cross-entropy of the pileup logits against the matched targets' ispu.
 
@@ -156,6 +160,10 @@ def set_event_loss(
             matched_predictions[key].append(predictions[key][event_idx, slot_indices])
         for key in matched_targets:
             matched_targets[key].append(targets[key][event_idx, valid_targets][target_indices])
+
+    if guard_slots is not None:
+        # -100 is cross_entropy's default ignore_index
+        presence_targets = presence_targets.masked_fill(guard_slots.bool() & (presence_targets == 0), -100)
 
     presence_class_weights = predictions["cls_binary"].new_tensor([no_object_weight, 1.0])
     presence_loss = F.cross_entropy(
@@ -221,7 +229,9 @@ def _seed_diagnostics(seed_index, is_anchor, batch, num_slots):
     short = num_targets.clamp_max(num_slots) > seeded
     if short.any():
         event_idx = int(short.nonzero()[0].item())
-        where = f" (event_id {int(batch.event_id[event_idx])})" if getattr(batch, "event_id", None) is not None else ""
+        where = ""
+        if getattr(batch, "crop_id", None) is not None:
+            where = f" (event_id {int(batch.event_id[event_idx])}, crop_id {int(batch.crop_id[event_idx])})"
         n, k = int(num_targets[event_idx]), int(seeded[event_idx])
         raise ValueError(f"Batch entry {event_idx}{where} has {n} targets but only {k} seeded slots of {num_slots}")
     out = {"SeededSlots": seeded.float().mean(), "UnseededSlots": (num_slots - seeded).float().mean()}
@@ -263,12 +273,14 @@ def set_mlpf_loss(
     presence_normalization="mean",
     seed_index=None,
     is_anchor=None,
+    anchor_guard=None,
     strict_seeding=False,
     pileup_loss_weight=0.0,
 ):
     """Compute the set-prediction objective with the standard task names.
 
-    allow_unmatched_targets logs UnmatchedTargets (count) and UnmatchedTargetFraction. strict_seeding raises if an
+    With batch.elem_interior (crops), the slots seeded on guard elements and the anchor_guard slots are guard slots of
+    set_event_loss. allow_unmatched_targets logs UnmatchedTargets (count) and UnmatchedTargetFraction. strict_seeding raises if an
     event's matchable targets exceed its seeded slots (seed_index >= 0 or is_anchor) and logs SeededSlots, UnseededSlots
     and AnchorSlots (means per event).
     """
@@ -279,6 +291,12 @@ def set_mlpf_loss(
     seed_diagnostics = {}
     if strict_seeding:
         seed_diagnostics = _seed_diagnostics(seed_index, is_anchor, batch, predictions["cls_binary"].shape[1])
+    guard_slots = None
+    if seed_index is not None and getattr(batch, "elem_interior", None) is not None:
+        seed_interior = torch.gather(batch.elem_interior.bool(), 1, seed_index.clamp_min(0))
+        guard_slots = (seed_index >= 0) & ~seed_interior
+    if anchor_guard is not None:
+        guard_slots = anchor_guard if guard_slots is None else guard_slots | anchor_guard
 
     extra_costs = None
     if hit_assignment_dice_cost > 0 and hit_grouping is not None:
@@ -307,6 +325,7 @@ def set_mlpf_loss(
         momentum_huber_delta=momentum_huber_delta,
         presence_normalization=presence_normalization,
         pileup_loss_weight=pileup_loss_weight,
+        guard_slots=guard_slots,
     )
     task_losses = {task: losses[task] for task in LOSS_TASKS}
     if task_loss_weighter is None:
@@ -394,6 +413,7 @@ def set_mlpf_loss(
                 matches=matches,
                 presence_normalization=presence_normalization,
                 pileup_loss_weight=pileup_loss_weight,
+                guard_slots=guard_slots,
             )
             auxiliary_losses.append(sum(layer_losses.values()))
         losses["Auxiliary"] = auxiliary_loss_weight * torch.stack(auxiliary_losses).mean()

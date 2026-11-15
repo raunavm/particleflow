@@ -95,8 +95,8 @@ def test_strict_seeding_raises_when_targets_exceed_seeded_slots():
     _, losses, _ = loss(targets, raw, seed_index=seed_index, strict_seeding=True)
     torch.testing.assert_close(losses["SeededSlots"], torch.tensor(2.5))
     torch.testing.assert_close(losses["UnseededSlots"], torch.tensor(2.5))
-    batch = SimpleNamespace(target_mask=targets[..., 0] != 0, event_id=torch.tensor([640, 641]))
-    with pytest.raises(ValueError, match=r"Batch entry 1 \(event_id 641\) has 2 targets but only 1 seeded slots of 5"):
+    batch = SimpleNamespace(target_mask=targets[..., 0] != 0, event_id=torch.tensor([640, 641]), crop_id=torch.tensor([3, 3]))
+    with pytest.raises(ValueError, match=r"Batch entry 1 \(event_id 641, crop_id 3\) has 2 targets but only 1 seeded slots of 5"):
         loss(targets, raw, batch, seed_index=torch.tensor([[0, 1, 2, -1, -1], [0, -1, -1, -1, -1]]), strict_seeding=True)
     # anchors count as seeded
     is_anchor = torch.tensor([[False] * 5, [False, True, False, False, False]])
@@ -109,8 +109,8 @@ def test_anchor_score_is_the_smoothed_calorimeter_energy():
     eta, phi, energy = torch.rand(60, generator=g) * 2 - 1, torch.rand(60, generator=g) * 6.2 - 3.1, torch.rand(60, generator=g) * 3
     X, mask, _ = calo_inputs(eta, phi, energy, num_tracks=5)
     X[0, :5, 5] = 100.0  # track energy never counts
-    a_eta, a_phi, score = decoder._energy_anchors(X[0], mask[0] & (X[0, :, 0] == 2))
-    assert len(a_eta) == 180 * 128
+    a_eta, a_phi, score, interior = decoder._energy_anchors(X[0], mask[0] & (X[0, :, 0] == 2))
+    assert len(a_eta) == 180 * 128 and interior is None
     ce, cp, ref = brute_anchors(X)
     got = np.lexsort((a_phi.numpy(), a_eta.numpy()))
     want = np.lexsort((cp, ce))
@@ -122,9 +122,9 @@ def test_fill_unseeded_takes_the_free_slots_in_rank_order():
     g = torch.Generator().manual_seed(14)
     eta, phi, energy = torch.rand(12, generator=g) * 2 - 1, torch.rand(12, generator=g) * 2 - 1.7, torch.rand(12, generator=g) * 4
     X, mask, memory = calo_inputs(eta, phi, energy, num_tracks=3)
-    slots, references, _, _, _, (seed_index, is_anchor) = decoder._input_conditioned_queries(memory, mask, X, return_seeding=True)
+    slots, references, _, _, _, (seed_index, is_anchor, anchor_guard) = decoder._input_conditioned_queries(memory, mask, X, return_seeding=True)
     assert (seed_index[0, :15] >= 0).all() and (seed_index[0, 15:] == -1).all()
-    assert is_anchor[0].tolist() == [False] * 15 + [True] * 25
+    assert is_anchor[0].tolist() == [False] * 15 + [True] * 25 and anchor_guard is None
     ce, cp, _ = brute_anchors(X, count=25)
     assert np.allclose(references[0, 15:, 0].numpy(), ce, atol=1e-5) and np.allclose(references[0, 15:, 1].numpy(), cp, atol=1e-5)
     position = torch.stack([references[0, 15, 0], torch.sin(references[0, 15, 1]), torch.cos(references[0, 15, 1])])

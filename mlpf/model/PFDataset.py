@@ -1,4 +1,5 @@
 import sys
+import bisect
 import os
 import random
 import resource
@@ -12,6 +13,7 @@ import torch.utils.data
 
 from mlpf.logger import _logger
 from mlpf.conf import DatasetSamplerMode, MLPFConfig, OutputMode, Y_FEATURES, dataset_input_type_id, dataset_source_id
+from mlpf.model.crops import choose_crops, crop_record, n_crops, positions
 
 
 # https://github.com/pytorch/pytorch/issues/11201#issuecomment-895047235
@@ -146,7 +148,9 @@ class TFDSDataSource:
         set_target_source="element_rows",
         align_particle_numbers=False,
         colliderml_data=None,
+        raw=False,
     ):
+        """raw: return the decoded record; the caller (CropDataset) finalizes it."""
         self.ds = ds
         tmp = self.ds.dataset_info
         self.ds.dataset_info = SimpleNamespace()
@@ -164,6 +168,12 @@ class TFDSDataSource:
         feature_keys = tmp.features.keys() if hasattr(tmp.features, "keys") else ()
         self.skip_keys = colliderml_skipped_keys(colliderml_data, feature_keys)
         self._reader = None
+        self.raw = raw
+
+    def build_gen_target_set(self, ret):
+        if self.align_particle_numbers:
+            align_particle_numbers(ret)
+        ret["ytarget_set"] = gen_target_to_set(ret["gen_target"])
 
     def _close_extra_readers(self):
         # ArrayRecordDataSource caches one reader per shard file forever, so the
@@ -210,6 +220,13 @@ class TFDSDataSource:
         Xshape = ret["X"].shape
         _logger.debug(f"Getting item={item}, ds={ds_name}:{self.ds.dataset_info.config_name}, X={Xshape}")
 
+        if self.raw:
+            return ret
+        return self.finalize(ret)
+
+    def finalize(self, ret):
+        """Per-record transforms after decoding, and after cropping: padding, sorting, label remapping and targets."""
+        ds_name = self.ds.dataset_info.name
         if self.feature_dim is not None:
             if ret["X"].shape[1] > self.feature_dim:
                 raise ValueError(f"Input feature dimension {ret['X'].shape[1]} exceeds configured feature_dim={self.feature_dim}")
@@ -228,6 +245,8 @@ class TFDSDataSource:
             ret["X"] = ret["X"][sortidx]
             ret["ycand"] = ret["ycand"][sortidx]
             ret["ytarget"] = ret["ytarget"][sortidx]
+            if "elem_interior" in ret:
+                ret["elem_interior"] = ret["elem_interior"][sortidx]
 
         # Pad elements to the nearest multiple if specified
         if self.pad_to_multiple and self.pad_to_multiple > 0:
@@ -239,6 +258,8 @@ class TFDSDataSource:
                         array_to_pad = ret[key_to_pad]
                         pad_width = ((0, num_to_pad), (0, 0))  # Pad only the first axis
                         ret[key_to_pad] = np.pad(array_to_pad, pad_width, mode="constant", constant_values=0)
+                if "elem_interior" in ret:
+                    ret["elem_interior"] = np.pad(ret["elem_interior"], (0, num_to_pad), mode="constant", constant_values=False)
 
         if ds_name.startswith("cms_"):
             # track, target label neutral hadron -> reconstruct as charged hadron
@@ -280,9 +301,8 @@ class TFDSDataSource:
             ret["X"][:, 1][msk_ho] = np.sqrt(e**2 - (np.tanh(eta) * e) ** 2)
 
         if self.build_target_set and self.set_target_source == "gen_target":
-            if self.align_particle_numbers:
-                align_particle_numbers(ret)
-            ret["ytarget_set"] = gen_target_to_set(ret["gen_target"])
+            if "ytarget_set" not in ret:
+                self.build_gen_target_set(ret)
         elif self.build_target_set:
             # Existing hit datasets store one full target row on an exclusive
             # representative hit for every particle. Other related hits contain
@@ -349,6 +369,7 @@ class PFDataset:
         set_target_source="element_rows",
         align_particle_numbers=False,
         colliderml_data=None,
+        raw=False,
     ):
         """
         Args
@@ -379,6 +400,7 @@ class PFDataset:
             set_target_source=set_target_source,
             align_particle_numbers=align_particle_numbers,
             colliderml_data=colliderml_data,
+            raw=raw,
         )
 
         if num_samples and num_samples < len(self.ds):
@@ -386,6 +408,48 @@ class PFDataset:
 
     def __len__(self):
         return len(self.ds)
+
+
+class CropDataset(torch.utils.data.Dataset):
+    """Crops of the events of a ConcatDataset of raw TFDSDataSources.
+
+    A key is epoch * N + event index (EpochKeySampler), so the crops of an event depend only on (seed, epoch, event_id).
+    An item is the list of the event's finalized crops. Training draws crops_per_event crops per epoch with the run seed;
+    validation always draws val_crops with val_seed at epoch 0.
+    """
+
+    def __init__(self, concat, mode, crop_cfg, seed=0):
+        if mode not in ("train", "valid"):
+            raise ValueError(f"CropDataset mode must be 'train' or 'valid', not {mode!r}")
+        self.concat = concat
+        self.mode = mode
+        self.cfg = crop_cfg
+        self.seed = seed
+        self.n_crops = n_crops(crop_cfg.eta_edges, crop_cfg.nphi)
+
+    def __len__(self):
+        return len(self.concat)
+
+    def __getitem__(self, key):
+        epoch, idx = divmod(int(key), len(self))
+        rec = self.concat[idx]
+        src = self.concat.datasets[bisect.bisect_right(self.concat.cumulative_sizes, idx)]
+        src = getattr(src, "dataset", src)  # torch Subset with num_samples
+        if src.build_target_set:
+            # set targets before cropping, so the element particle numbers keep pointing at them
+            src.build_gen_target_set(rec)
+        event_id = int(rec["event_id"])
+        if self.mode == "train":
+            crops = choose_crops(self.seed, epoch, event_id, self.cfg.crops_per_event, self.n_crops)
+        else:
+            crops = choose_crops(self.cfg.val_seed, 0, event_id, self.cfg.val_crops, self.n_crops)
+        pos = positions(rec)
+        out = []
+        for crop in crops:
+            r = crop_record(rec, crop, self.cfg.guard, self.cfg.eta_edges, self.cfg.nphi, pos=pos)
+            r["crop_id"] = np.int64(crop)
+            out.append(src.finalize(r))
+        return out
 
 
 class PFBatch:
@@ -408,6 +472,9 @@ class PFBatch:
         self.targetjets = kwargs.get("targetjets", None)
         self.source_id = kwargs.get("source_id", None)
         self.input_type_id = kwargs.get("input_type_id", None)
+        self.elem_interior = kwargs.get("elem_interior", None)  # crops: 1 = interior element, 0 = guard or padding
+        self.event_id = kwargs.get("event_id", None)
+        self.crop_id = kwargs.get("crop_id", None)
         self.mask = self.X[:, :, 0] != 0
         self.target_mask = self.ytarget_set[:, :, 0] != 0 if self.ytarget_set is not None else None
 
@@ -428,6 +495,8 @@ class Collater:
 
     def __call__(self, inputs):
         ret = {}
+        # CropDataset items are lists of crops: the batch is events x crops
+        inputs = [rec for inp in inputs for rec in (inp if isinstance(inp, list) else [inp])]
 
         # per-particle quantities need to be padded across events of different size
         for key_to_get in self.per_particle_keys_to_get:
@@ -644,6 +713,27 @@ class ResumableSampler(torch.utils.data.Sampler):
     def set_epoch(self, epoch):
         if hasattr(self.sampler, "set_epoch"):
             self.sampler.set_epoch(epoch)
+
+
+class EpochKeySampler(torch.utils.data.Sampler):
+    """Yields epoch * num_events + index for the indices of inner, so the epoch reaches persistent workers with each key."""
+
+    def __init__(self, inner, num_events):
+        self.inner = inner
+        self.num_events = num_events
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+        if hasattr(self.inner, "set_epoch"):
+            self.inner.set_epoch(epoch)
+
+    def __iter__(self):
+        offset = self.epoch * self.num_events
+        return iter([offset + idx for idx in self.inner])
+
+    def __len__(self):
+        return len(self.inner)
 
 
 class InterleavedIterator(object):
@@ -947,6 +1037,7 @@ def get_interleaved_dataloaders(world_size, rank, config: MLPFConfig, use_cuda, 
                         set_target_source=config.set_target_source,
                         align_particle_numbers=uses_hit_grouping(config),
                         colliderml_data=config.colliderml_data,
+                        raw=config.crop.enabled,
                     ).ds
 
                     if (rank == 0) or (rank == "cpu"):
@@ -969,6 +1060,9 @@ def get_interleaved_dataloaders(world_size, rank, config: MLPFConfig, use_cuda, 
             else:
                 sampler = ShardConsecutiveSampler(dataset, shuffle=shuffle, seed=config.seed)
 
+            if config.crop.enabled:
+                sampler = EpochKeySampler(sampler, len(dataset))
+                dataset = CropDataset(dataset, split, config.crop, seed=config.seed)
             sampler = ResumableSampler(sampler)
             sampler.name = f"{type_}:{split}"
 
@@ -977,6 +1071,10 @@ def get_interleaved_dataloaders(world_size, rank, config: MLPFConfig, use_cuda, 
             per_particle_keys = ["X", "ytarget"]
             if config.model.output_mode == OutputMode.SET:
                 per_particle_keys.append("ytarget_set")
+            per_event_keys = ["genmet", "source_id", "input_type_id"]
+            if config.crop.enabled:
+                per_particle_keys.append("elem_interior")
+                per_event_keys += ["event_id", "crop_id"]
             loader_generator = torch.Generator()
             rank_index = int(rank) if isinstance(rank, int) else 0
             split_offset = 0 if split == "train" else 1000
@@ -993,7 +1091,7 @@ def get_interleaved_dataloaders(world_size, rank, config: MLPFConfig, use_cuda, 
             loader = torch.utils.data.DataLoader(
                 dataset,
                 batch_size=batch_size,
-                collate_fn=Collater(per_particle_keys, ["genmet", "source_id", "input_type_id"]),
+                collate_fn=Collater(per_particle_keys, per_event_keys),
                 sampler=sampler,
                 num_workers=config.num_workers,
                 # Training uses fixed-size batches, but a bounded validation

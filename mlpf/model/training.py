@@ -408,6 +408,7 @@ def _set_loss_kwargs(model_module, raw_predictions):
         "presence_normalization": config.presence_normalization,
         "seed_index": raw_predictions.seed_index,
         "is_anchor": raw_predictions.is_anchor,
+        "anchor_guard": raw_predictions.anchor_guard,
         "strict_seeding": config.strict_seeding,
         "pileup_loss_weight": config.pileup_loss_weight,
     }
@@ -567,9 +568,16 @@ def _current_step_memory_summary(diagnostics):
     }
 
 
+def _forward(model, batch):
+    """The model on a batch; crops also pass their interior mask and crop ids."""
+    if getattr(batch, "elem_interior", None) is None:
+        return model(batch.X, batch.mask, source_id=batch.source_id)
+    return model(batch.X, batch.mask, source_id=batch.source_id, elem_interior=batch.elem_interior, crop_id=batch.crop_id)
+
+
 def model_step(batch, model, loss_fn, regression_weights):
     _logger.debug(f"model_step X={batch.X.shape}")
-    ypred_raw = model(batch.X, batch.mask, source_id=batch.source_id)
+    ypred_raw = _forward(model, batch)
     ypred = unpack_predictions(ypred_raw)
     model_module = model.module if hasattr(model, "module") else model
     if model_module.output_mode == OutputMode.SET:
@@ -685,7 +693,7 @@ def train_step(
     phase_start = time.perf_counter()
     with torch.autocast(device_type=device_type, dtype=dtype, enabled=device_type == "cuda"):
         _logger.debug(f"model_step X={batch.X.shape}")
-        ypred_raw = model(batch.X, batch.mask, source_id=batch.source_id)
+        ypred_raw = _forward(model, batch)
     phase_start = _record_phase_time_if_enabled(diagnostics.get("time", {}), "forward", phase_start, device_type, log_this_step)
     if log_this_step:
         _collect_step_memory(rank, "after_forward", diagnostics)
@@ -1021,7 +1029,8 @@ def evaluate(
                     )
 
                 model_module = model.module if hasattr(model, "module") else model
-                ypred_particles = model_module.predict_particles(batch.X, batch.mask, source_id=batch.source_id)
+                crop_kwargs = {} if batch.elem_interior is None else {"elem_interior": batch.elem_interior, "crop_id": batch.crop_id}
+                ypred_particles = model_module.predict_particles(batch.X, batch.mask, source_id=batch.source_id, **crop_kwargs)
                 metric_collections = validation_particle_collections(
                     batch,
                     ypred_particles,

@@ -1191,6 +1191,31 @@ class ColliderMLDataConfig(BaseModel):
         return int(self.use_layer)
 
 
+class CropConfig(BaseModel):
+    """(eta, phi) crops of large events for set-output training (mlpf/model/crops.py)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    # interiors tile the event; the outer eta bins are open
+    eta_edges: Tuple[float, ...] = (float("-inf"), -2.4, -0.8, 0.8, 2.4, float("inf"))
+    nphi: int = Field(default=4, gt=0)
+    guard: float = Field(default=0.2, ge=0.0)  # input-only margin around each interior, in eta and in phi
+    crops_per_event: int = Field(default=4, gt=0)  # training crops drawn per event and epoch, without replacement
+    val_seed: int = Field(default=0, ge=0)  # validation crops are drawn once with this seed
+    val_crops: int = Field(default=4, gt=0)
+
+    @model_validator(mode="after")
+    def validate_edges(self):
+        e = self.eta_edges
+        if len(e) < 2 or e[0] != float("-inf") or e[-1] != float("inf") or any(a >= b for a, b in zip(e[:-1], e[1:])):
+            raise ValueError("crop.eta_edges must be strictly increasing from -inf to +inf")
+        n = (len(e) - 1) * self.nphi
+        if self.crops_per_event > n or self.val_crops > n:
+            raise ValueError(f"crop.crops_per_event and crop.val_crops must not exceed the {n} crops per event")
+        return self
+
+
 class LRFinderConfig(BaseModel):
     """LR range test (`mlpf/pipeline.py lr-find`): exponential lr ramp, loss recorded per step."""
 
@@ -1494,6 +1519,7 @@ class MLPFConfig(BaseModel):
     # set-output targets: the representative element rows of ytarget, or the gen_target rows of the record
     set_target_source: Literal["element_rows", "gen_target"] = "element_rows"
     colliderml_data: ColliderMLDataConfig = Field(default_factory=ColliderMLDataConfig)
+    crop: CropConfig = Field(default_factory=CropConfig)
     load: Optional[str] = None  # path to model and optimizer checkpoint to load
     relaxed_load: bool = False  # if enabled, skip layer mismatch and optimizer in loading
     load_weights_only: bool = False  # load only the model weights from --load; optimizer, LR schedule, RNG, sampler and step start fresh
@@ -1602,6 +1628,20 @@ class MLPFConfig(BaseModel):
             if version is not None and versions.setdefault(dataset, version) != version:
                 raise ValueError(f"{dataset} samples have versions {versions[dataset]} and {version}")
         return versions
+
+    @model_validator(mode="after")
+    def validate_crops(self) -> "MLPFConfig":
+        if not self.crop.enabled:
+            return self
+        if self.dataset.value.endswith("_hits") or any("_hits" in name for name, _ in self._samples()):
+            raise ValueError("crop.enabled cannot be used on a hits dataset")
+        if self.sort_data:
+            raise ValueError("crop.enabled cannot be combined with sort_data")
+        if self.model.output_mode != OutputMode.SET or self.set_target_source != "gen_target":
+            raise ValueError("crop.enabled needs output_mode='set' and set_target_source='gen_target'")
+        if self.model.set_decoder.event_consistency_loss_weight > 0:
+            raise ValueError("crop.enabled cannot use event_consistency_loss_weight: it would sum guard slots")
+        return self
 
     @model_validator(mode="after")
     def validate_colliderml_data(self) -> "MLPFConfig":

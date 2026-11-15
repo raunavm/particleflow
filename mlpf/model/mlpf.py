@@ -1563,7 +1563,9 @@ class MLPF(nn.Module):
         self.nn_cos_phi = None
         self.nn_energy = None
         if self.output_mode == OutputMode.SET:
-            self.set_decoder = ParticleSetDecoder(decoding_dim, self.num_classes, self.config.set_decoder)
+            crop = config.crop
+            crop_geometry = (crop.eta_edges, crop.nphi, crop.guard) if crop.enabled else None
+            self.set_decoder = ParticleSetDecoder(decoding_dim, self.num_classes, self.config.set_decoder, crop_geometry)
         else:
             self.nn_binary_particle = ffn(decoding_dim, 2, width, self.act, head_dropout_ff)
             self.nn_pid = ffn(decoding_dim, self.num_classes, width, self.act, head_dropout_ff)
@@ -1930,9 +1932,10 @@ class MLPF(nn.Module):
         return self.regression_norm
 
     # @torch.compile
-    def forward(self, X_features, mask, source_id=None):
+    def forward(self, X_features, mask, source_id=None, elem_interior=None, crop_id=None):
+        # elem_interior, crop_id: crop-interior mask per element and crop per entry, set output only
         if self.output_mode == OutputMode.SET:
-            return self.set_decoder(self.encode_backbone(X_features, mask, source_id=source_id), mask, X_features)
+            return self.set_decoder(self.encode_backbone(X_features, mask, source_id=source_id), mask, X_features, elem_interior, crop_id)
 
         X_features = self._engineer_input_features(X_features, mask)
         if self.use_split_backbone:
@@ -1991,10 +1994,11 @@ class MLPF(nn.Module):
 
         return preds_binary_particle, preds_pid, preds_momentum, preds_pu
 
-    def predict_particles(self, X_features, mask, source_id=None):
+    def predict_particles(self, X_features, mask, source_id=None, elem_interior=None, crop_id=None):
         from mlpf.model.utils import unpack_predictions
 
-        ypred_raw = self.forward(X_features, mask, source_id=source_id)
+        crop_kwargs = {} if elem_interior is None else {"elem_interior": elem_interior, "crop_id": crop_id}
+        ypred_raw = self.forward(X_features, mask, source_id=source_id, **crop_kwargs)
         ypred_raw = [y.to(torch.float32) for y in ypred_raw]
 
         if self.output_mode == OutputMode.SET:
