@@ -9,6 +9,7 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from mlpf.logger import _logger
+from mlpf.model.seeding import local_max
 from mlpf.model.tracker_group_readout import SUMMARY_DIM, tracker_group_geometry
 from mlpf.model.tracker_momentum_readout import (
     TrackerMomentumReadout,
@@ -418,6 +419,7 @@ class ParticleSetDecoder(nn.Module):
             self.tracker_momentum_head = TrackerMomentumReadout(embedding_dim, config.tracker_momentum_max_log_correction)
 
         self.strict_seeding = config.strict_seeding
+        self.calo_seed_local_max_radius = config.calo_seed_local_max_radius
         self.anchor_mode = config.anchor_mode
         self.anchor_eta_step = config.anchor_eta_step
         self.anchor_phi_bins = config.anchor_phi_bins
@@ -490,6 +492,18 @@ class ParticleSetDecoder(nn.Module):
         references[event_idx, anchor_slots] = reference
         reference_mask[event_idx, anchor_slots] = True
         is_anchor[event_idx, anchor_slots] = True
+
+    def _calo_seeds(self, input_features, scores, calorimeter, candidates, count):
+        """Calorimeter seeds: the top proposal scores, or with calo_seed_local_max_radius the local maxima first."""
+        if self.calo_seed_local_max_radius is None:
+            return self._take_topk(scores, candidates, count)
+        if input_features.shape[-1] < 12:
+            raise ValueError("calo_seed_local_max_radius needs raw input features through the HCAL energy (col 11)")
+        maxima = local_max(input_features.detach().double().cpu().numpy(), calorimeter.cpu().numpy(), self.calo_seed_local_max_radius)
+        first = self._take_topk(scores, candidates & torch.from_numpy(maxima).to(candidates.device), count)
+        rest = candidates.clone()
+        rest[first] = False
+        return torch.cat([first, self._take_topk(scores, rest, count - len(first))])
 
     @staticmethod
     def _angular_grid_summary(input_features, valid, grid_size):
@@ -622,7 +636,8 @@ class ParticleSetDecoder(nn.Module):
             tracker_indices = self._take_topk(proposal_scores, tracker_candidates, num_tracker_slots)
             chosen_mask[tracker_indices] = True
             calo_slots = self.num_slots - len(tracker_indices)
-            calo_indices = self._take_topk(proposal_scores, calorimeter & proposal_candidates & ~chosen_mask, calo_slots)
+            calo_candidates = calorimeter & proposal_candidates & ~chosen_mask
+            calo_indices = self._calo_seeds(input_features[event_idx], proposal_scores, calorimeter, calo_candidates, calo_slots)
             chosen_mask[calo_indices] = True
             selected = torch.cat([tracker_indices, calo_indices])
 

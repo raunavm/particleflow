@@ -1066,6 +1066,8 @@ class SetDecoderConfig(BaseModel):
     # (anchor_eta_step from eta = 0, anchor_phi_bins from -pi, |eta| <= anchor_eta_max) ranked by the calorimeter energy
     # within anchor_smoothing of their center
     anchor_mode: Literal["none", "fill_unseeded"] = "none"
+    # calorimeter slots go first to local energy maxima within this dR in their calorimeter, the rest by the usual ranking
+    calo_seed_local_max_radius: Optional[float] = Field(default=None, gt=0.0)
     anchor_eta_step: float = Field(default=0.05, gt=0.0)
     anchor_phi_bins: int = Field(default=128, gt=0)
     anchor_eta_max: float = Field(default=4.5, gt=0.0)
@@ -1114,6 +1116,8 @@ class SetDecoderConfig(BaseModel):
             raise ValueError("hit_energy_readout_detach requires hit_energy_readout")
         if self.hit_grouping_late and (self.hit_grouping_sparse or self.tracker_momentum_readout or self.tracker_group_readout):
             raise ValueError("hit_grouping_late pools nothing into the slots: no sparse association or tracker readouts")
+        if self.calo_seed_local_max_radius is not None and (self.query_init != SetQueryInit.INPUT_CONDITIONED or self.proposal_mode != "topk"):
+            raise ValueError("calo_seed_local_max_radius needs query_init='input-conditioned' and proposal_mode='topk'")
         if (self.strict_seeding or self.anchor_mode != "none") and self.query_init != SetQueryInit.INPUT_CONDITIONED:
             raise ValueError("set decoder strict_seeding and anchor_mode require query_init='input-conditioned'")
         return self

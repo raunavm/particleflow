@@ -145,3 +145,37 @@ def test_no_anchor_parameters_or_slots_by_default():
     assert decoder.anchor_embedding is None and "anchor_embedding" not in decoder.state_dict()
     X, mask, memory = make_inputs()
     assert not decoder(memory, mask, X).is_anchor.any()
+
+
+def test_a_neighbor_of_a_brighter_hit_is_seeded_only_after_the_maxima():
+    # one track, then calorimeter hits 1 (E 5) and 2 (E 4) 0.01 apart in the ECAL and an isolated hit 3 (E 1)
+    X = torch.zeros(1, 4, 17)
+    X[0, :, 0] = torch.tensor([1.0, 2, 2, 2])
+    X[0, :, 5] = torch.tensor([10.0, 5, 4, 1])
+    X[0, :, 1] = X[0, :, 5]
+    eta, phi = torch.tensor([0.0, 1.0, 1.01, -1.0]), torch.tensor([0.0, 0.5, 0.5, 2.0])
+    X[0, :, 2], X[0, :, 3], X[0, :, 4] = eta, torch.sin(phi), torch.cos(phi)
+    X[0, 1:, 10] = X[0, 1:, 5]
+    mask = torch.ones(1, 4, dtype=torch.bool)
+
+    def seeded(radius):
+        out = build_decoder(num_slots=3, calo_seed_local_max_radius=radius)(torch.randn(1, 4, DIM), mask, X)
+        return set(out.seed_index[0][out.seed_index[0] >= 0].tolist())
+
+    # 3 slots: 2 tracker slots, 1 used, so the calorimeter gets 2
+    assert seeded(None) == {0, 1, 2}
+    assert seeded(0.02) == {0, 1, 3}
+    assert seeded(0.005) == {0, 1, 2}
+
+
+def test_local_max_seeds_fill_every_slot():
+    X, mask, memory = make_inputs(batch_size=2, num_elements=40, seed=3)
+    X[..., 2] = X[..., 2] * 0.05
+    X[..., 10] = torch.where(torch.arange(40) % 2 == 0, X[..., 5], 0.0)
+    X[..., 11] = torch.where(torch.arange(40) % 2 == 1, X[..., 5], 0.0)
+    out = build_decoder(num_slots=24, calo_seed_local_max_radius=0.05)(memory, mask, X)
+    for b in range(2):
+        seeds = out.seed_index[b]
+        assert (seeds >= 0).all() and len(set(seeds.tolist())) == 24
+    with pytest.raises(ValueError, match="calo_seed_local_max_radius"):
+        SetDecoderConfig(calo_seed_local_max_radius=0.02)
