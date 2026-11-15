@@ -1499,6 +1499,9 @@ class MLPFConfig(BaseModel):
     optimizer: OptimizerType = OptimizerType.ADAMW
     # global gradient-norm clip: LAMB's max_grad_norm, or clip_grad_norm_ before the AdamW step; not for SGD
     gradient_clip_norm: Optional[float] = Field(default=None, gt=0.0)
+    # each training batch is split into this many equal micro-batches along the event axis, whose gradients are summed
+    # before one optimizer step
+    gradient_accumulation_steps: int = Field(default=1, ge=1)
     lr_schedule: LRSchedule = LRSchedule.COSINEDECAY
     lr_schedule_config: Dict[str, Any] = Field(default_factory=dict)
     task_loss_weights: TaskLossWeights = Field(default_factory=TaskLossWeights)
@@ -1635,6 +1638,9 @@ class MLPFConfig(BaseModel):
     def validate_gradient_clip(self) -> "MLPFConfig":
         if self.gradient_clip_norm is not None and self.optimizer == OptimizerType.SGD:
             raise ValueError("gradient_clip_norm is implemented for LAMB and AdamW, not SGD")
+        # the task-loss weighter counts forward passes; a multiple keeps its switch on an optimizer-step boundary
+        if self.task_loss_weights.calibration_steps % self.gradient_accumulation_steps != 0:
+            raise ValueError("task_loss_weights.calibration_steps must be a multiple of gradient_accumulation_steps")
         return self
 
     @model_validator(mode="after")

@@ -297,3 +297,27 @@ def test_gradient_clip_is_lambs_max_grad_norm():
         assert get_optimizer(model, config).defaults["max_grad_norm"] == want
     with pytest.raises(ValueError, match="not SGD"):
         mlpf_config(**LATE).model_validate(dict(mlpf_config(**LATE).model_dump(), optimizer="sgd", gradient_clip_norm=1.0))
+
+
+def test_gradient_accumulation_sums_micro_batch_gradients():
+    from mlpf.model.training import train_step
+
+    one = model_batch()
+    batch = PFBatch(**{a: (torch.cat([getattr(one, a)] * 4) if getattr(one, a) is not None else None) for a in one.attrs})
+    grads = []
+    for steps in (1, 2, 4):
+        torch.manual_seed(0)
+        model = MLPF(mlpf_config(**LATE))
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+        scaler = torch.amp.GradScaler("cpu", enabled=False)
+        args = ("cpu", 1, model, optimizer, batch, None, 1, REGRESSION_WEIGHTS)
+        train_step(*args, device_type="cpu", scaler=scaler, gradient_accumulation_steps=steps)
+        grads.append({n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None})
+    for other in grads[1:]:
+        assert other.keys() == grads[0].keys()
+        for n in grads[0]:
+            torch.testing.assert_close(other[n], grads[0][n], rtol=1e-4, atol=1e-6)
+    with pytest.raises(ValueError, match="equal micro-batches"):
+        train_step("cpu", 1, model, optimizer, batch, None, 1, REGRESSION_WEIGHTS, device_type="cpu", scaler=scaler, gradient_accumulation_steps=3)
+    with pytest.raises(ValueError, match="multiple of gradient_accumulation_steps"):
+        MLPFConfig.model_validate(dict(mlpf_config(**LATE).model_dump(), gradient_accumulation_steps=3))

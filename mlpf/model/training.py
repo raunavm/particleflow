@@ -83,6 +83,7 @@ from mlpf.model.plots import validation_plots
 from mlpf.model.mlpf import MLPF, configure_model_trainable
 from mlpf.model.PFDataset import (
     Collater,
+    PFBatch,
     PFDataset,
     get_interleaved_dataloaders,
     set_worker_sharing_strategy,
@@ -619,6 +620,35 @@ def optimizer_step(model, loss_opt, optimizer, lr_schedule, scaler):
             lr_schedule.step()
 
 
+def _accumulate_micro_batches(model, batch, steps, regression_weights, scaler, device_type, dtype):
+    """Clear the gradients, split batch into steps equal micro-batches along the event axis and run forward, loss and
+    backward (loss / steps) on all but the last. Returns the last micro-batch and the losses of the others."""
+    for param in model.parameters():
+        param.grad = None
+    if steps == 1:
+        return batch, []
+    num_events = batch.X.shape[0]
+    if num_events % steps != 0:
+        raise ValueError(f"batch of {num_events} events does not split into {steps} equal micro-batches")
+    size = num_events // steps
+    micro_batches = [
+        PFBatch(**{a: (getattr(batch, a)[i : i + size] if getattr(batch, a) is not None else None) for a in batch.attrs})
+        for i in range(0, num_events, size)
+    ]
+    losses = []
+    for micro_batch in micro_batches[:-1]:
+        with torch.autocast(device_type=device_type, dtype=dtype, enabled=device_type == "cuda"):
+            micro_loss_opt, micro_loss, _, _, _, _ = model_step(micro_batch, model, mlpf_loss, regression_weights)
+        scaler.scale(micro_loss_opt / steps).backward()
+        losses.append(micro_loss)
+    return micro_batches[-1], losses
+
+
+def _mean_losses(losses):
+    """Mean of the micro-batch loss dicts."""
+    return {name: sum(micro[name] for micro in losses) / len(losses) for name in losses[0]}
+
+
 def train_step(
     rank: int | str,
     world_size: int,
@@ -636,6 +666,7 @@ def train_step(
     scaler=None,
     loader_stats=None,
     gradient_clip_norm=None,
+    gradient_accumulation_steps=1,
 ):
     """Run one training step
 
@@ -653,6 +684,8 @@ def train_step(
         device_type: 'cuda' or 'cpu'
         dtype: Torch dtype for computations
         gradient_clip_norm: global gradient-norm clip before the optimizer step, None for none
+        gradient_accumulation_steps: split the batch into this many equal micro-batches along the event axis and sum
+            their gradients (each loss scaled by 1/N) before one optimizer step; the returned losses are their mean
 
     Returns:
         dict: Dictionary of step losses
@@ -692,6 +725,8 @@ def train_step(
     if log_this_step:
         _collect_step_memory(rank, "after_batch_to_device", diagnostics)
 
+    batch, earlier_losses = _accumulate_micro_batches(model, batch, gradient_accumulation_steps, regression_weights, scaler, device_type, dtype)
+
     phase_start = time.perf_counter()
     with torch.autocast(device_type=device_type, dtype=dtype, enabled=device_type == "cuda"):
         _logger.debug(f"model_step X={batch.X.shape}")
@@ -729,12 +764,11 @@ def train_step(
         _collect_step_memory(rank, "after_loss", diagnostics)
 
     phase_start = time.perf_counter()
-    for param in model.parameters():
-        param.grad = None
     phase_start = _record_phase_time_if_enabled(diagnostics.get("time", {}), "zero_grad", phase_start, device_type, log_this_step)
 
     _logger.debug(f"optimizer_step scale={scaler.get_scale():.2E}")
-    scaler.scale(loss_opt).backward()
+    scaler.scale(loss_opt / gradient_accumulation_steps).backward()
+    loss = _mean_losses(earlier_losses + [loss])
     phase_start = _record_phase_time_if_enabled(diagnostics.get("time", {}), "backward", phase_start, device_type, log_this_step)
     if log_this_step:
         _collect_step_memory(rank, "after_backward", diagnostics)
@@ -1561,6 +1595,7 @@ def train_all_steps(
             loader_stats=train_loader.stats() if (log_this_step and tensorboard_writer_train is not None) else None,
             regression_weights=UNIT_REGRESSION_WEIGHTS,
             gradient_clip_norm=config.gradient_clip_norm if config.optimizer == OptimizerType.ADAMW else None,
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
         )
         log_memory("train_step_end", rank, tensorboard_writer_train if log_this_step else None, step)
         model_forward_time = time.time() - model_forward_start
