@@ -343,6 +343,7 @@ class ParticleSetDecoder(nn.Module):
         self.hit_grouping_temperature = config.hit_grouping_temperature
         self.hit_grouping_late = config.hit_grouping_late
         self.hit_energy_readout = config.hit_energy_readout
+        self.hit_energy_readout_detach = config.hit_energy_readout_detach
         self.tracker_momentum_readout = config.tracker_momentum_readout
         self.tracker_group_readout = config.tracker_group_readout
         self.tracker_fit_correction = config.tracker_fit_correction
@@ -950,7 +951,8 @@ class ParticleSetDecoder(nn.Module):
                     seed_type = torch.gather(input_features[..., 0], 1, seed_index.clamp_min(0))
                     readout = ~((seed_index >= 0) & (seed_type == 1))
             if self.use_auxiliary_losses or is_final_layer:
-                outputs.append(self._predict(slots, references, scale_anchors, scale_anchor_mask, tracker_fit, tracker_summary, hit_energy, readout))
+                read_energy = hit_energy.detach() if hit_energy is not None and self.hit_energy_readout_detach else hit_energy
+                outputs.append(self._predict(slots, references, scale_anchors, scale_anchor_mask, tracker_fit, tracker_summary, read_energy, readout))
 
         auxiliary_predictions = tuple(outputs[:-1]) if self.use_auxiliary_losses else ()
         return ParticleSetDecoderOutput(

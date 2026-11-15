@@ -187,3 +187,23 @@ def test_model_step_trains_late_grouping_end_to_end():
     assert model.set_decoder.energy_correction[0].weight.grad is not None
     p = unpack_predictions(model(batch.X, batch.mask).predictions)
     assert torch.isfinite(p["energy"]).all() and math.isfinite(float(p["pt"].sum()))
+
+
+def test_detach_stops_the_energy_output_at_the_assignment_and_changes_no_value():
+    X, mask = colliderml_inputs()
+    memory = torch.randn(2, X.shape[1], DIM, generator=torch.Generator().manual_seed(1))
+    decoders = []
+    for detach in (False, True):
+        torch.manual_seed(0)
+        config = SetDecoderConfig(num_slots=8, num_layers=2, num_heads=2, hit_grouping_chunk_size=3, hit_energy_readout_detach=detach, **LATE)
+        decoders.append(ParticleSetDecoder(DIM, NUM_CLASSES, config))
+    a, b = (dec(memory, mask, X) for dec in decoders)
+    assert all(torch.equal(p, q) for p, q in zip(a.predictions, b.predictions))
+    for out, dec, reaches in ((a, decoders[0], True), (b, decoders[1], False)):
+        (out.predictions[2][..., 4].sum() + out.predictions[2][..., 0].sum()).backward(retain_graph=True)
+        for name in ("hit_grouping_hit", "hit_grouping_slot", "hit_grouping_background"):
+            grad = getattr(dec, name).weight.grad
+            assert (grad is not None and grad.abs().sum() > 0) == reaches, name
+        assert dec.energy_correction[-1].weight.grad.abs().sum() > 0
+    with pytest.raises(ValueError, match="hit_energy_readout_detach requires hit_energy_readout"):
+        SetDecoderConfig(query_init="input-conditioned", hit_grouping=True, hit_grouping_late=True, hit_energy_readout_detach=True)

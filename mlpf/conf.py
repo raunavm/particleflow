@@ -1051,6 +1051,8 @@ class SetDecoderConfig(BaseModel):
     # slot energy = assigned ECAL + HCAL energy x exp(learned correction) for every slot not seeded on a track, and
     # pt from it with a learned neutral-hadron mass; ColliderML layout only
     hit_energy_readout: bool = False
+    # the slot energy and pt read the assigned energy detached, so the regression loss does not reach the assignment
+    hit_energy_readout_detach: bool = False
     # the grouping loss weights calorimeter elements by energy over the event's mean calorimeter energy
     hit_grouping_energy_weighted: bool = False
     # every track gets a slot (raises if the tracks exceed the tracker slots), and a batch raises if an event's
@@ -1102,6 +1104,8 @@ class SetDecoderConfig(BaseModel):
             raise ValueError("hit_grouping_energy_weighted cannot be combined with hit_grouping_detector_balanced")
         if self.hit_energy_readout and not self.hit_grouping_late:
             raise ValueError("hit_energy_readout requires hit_grouping_late")
+        if self.hit_energy_readout_detach and not self.hit_energy_readout:
+            raise ValueError("hit_energy_readout_detach requires hit_energy_readout")
         if self.hit_grouping_late and (self.hit_grouping_sparse or self.tracker_momentum_readout or self.tracker_group_readout):
             raise ValueError("hit_grouping_late pools nothing into the slots: no sparse association or tracker readouts")
         if (self.strict_seeding or self.anchor_mode != "none") and self.query_init != SetQueryInit.INPUT_CONDITIONED:
