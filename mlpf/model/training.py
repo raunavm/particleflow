@@ -1687,7 +1687,7 @@ def train_all_steps(
 
 def _test_samples(config: MLPFConfig):
     """The test datasets to run and plot; none with ntest = 0."""
-    if config.ntest == 0:
+    if getattr(config, "ntest", None) == 0:
         _logger.info("ntest=0: skipping the test datasets")
         return []
     return config.enabled_test_datasets
