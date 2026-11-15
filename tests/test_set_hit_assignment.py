@@ -7,7 +7,7 @@ from mlpf.conf import MLPFConfig, SetDecoderConfig
 from mlpf.model.PFDataset import PFBatch
 from mlpf.model.mlpf import MLPF
 from mlpf.model.set_decoder import ParticleSetDecoder, assigned_energy
-from mlpf.model.set_losses import hit_grouping_loss
+from mlpf.model.set_losses import assignment_dice_costs, assignment_dice_loss, hit_grouping_loss, hungarian_match
 from mlpf.model.utils import unpack_predictions
 
 DIM, NUM_CLASSES = 16, 6
@@ -207,3 +207,59 @@ def test_detach_stops_the_energy_output_at_the_assignment_and_changes_no_value()
         assert dec.energy_correction[-1].weight.grad.abs().sum() > 0
     with pytest.raises(ValueError, match="hit_energy_readout_detach requires hit_energy_readout"):
         SetDecoderConfig(query_init="input-conditioned", hit_grouping=True, hit_grouping_late=True, hit_energy_readout_detach=True)
+
+
+def hand_grouping(background=-100.0):
+    # slot 0 claims hits 1-3, slot 1 nothing certain; hit 4 goes to the background
+    keys = torch.tensor([[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]])
+    slots = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    return keys, slots, torch.tensor([[[background], [background], [background], [background], [100.0]]])
+
+
+def test_dice_cost_is_zero_for_the_owning_slot():
+    batch = grouping_batch()
+    keys = torch.tensor([[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]])
+    slots = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    background = torch.tensor([[[-100.0], [-100.0], [-100.0], [-100.0], [100.0]]])
+    (cost,) = assignment_dice_costs((keys, slots, background), batch, chunk_size=2)
+    assert cost.shape == (2, 2)
+    assert cost[0, 0] < 1e-3 and cost[1, 1] < 1e-3 and cost[0, 1] > 0.99 and cost[1, 0] > 0.99
+    # kinematics alone prefer the swapped pairing; a large Dice weight overrides them
+    targets = {"cls_id": torch.tensor([[1, 2]]), "eta": torch.tensor([[0.0, 1.0]]), "sin_phi": torch.zeros(1, 2), "cos_phi": torch.ones(1, 2)}
+    targets |= {"pt": torch.zeros(1, 2), "energy": torch.zeros(1, 2)}
+    predictions = {"cls_binary": torch.zeros(1, 2, 2), "cls_id_onehot": torch.zeros(1, 2, NUM_CLASSES), "eta": torch.tensor([[1.0, 0.0]])}
+    predictions |= {"sin_phi": torch.zeros(1, 2), "cos_phi": torch.ones(1, 2), "pt": torch.zeros(1, 2), "energy": torch.zeros(1, 2)}
+    swapped = hungarian_match(targets, predictions, torch.ones(1, 2))
+    assert swapped[0][0][swapped[0][1].argsort()].tolist() == [1, 0]
+    steered = hungarian_match(targets, predictions, torch.ones(1, 2), extra_costs=[100.0 * cost])
+    assert steered[0][0][steered[0][1].argsort()].tolist() == [0, 1]
+
+
+def test_dice_loss_hand_numbers():
+    batch = grouping_batch()
+    matches = [(torch.tensor([0, 1]), torch.tensor([0, 1]))]
+    loss = assignment_dice_loss(hand_grouping(), batch, matches, chunk_size=2)
+    # slot 0 takes 2 + 1 + 4 GeV of which its target owns 3: Dice 0.6; slot 1 takes nothing of its target's 4 GeV
+    assert float(loss) == pytest.approx(((1 - 0.6) + 1.0) / 2, abs=1e-4)
+    assert float(assignment_dice_loss(hand_grouping(), batch, matches, chunk_size=5)) == pytest.approx(float(loss), abs=1e-6)
+    batch.ytarget[0, :, 13] = torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0])  # no target owns calorimeter energy
+    assert float(assignment_dice_loss(hand_grouping(), batch, matches)) == 0.0
+
+
+def test_dice_loss_reaches_the_assignment_and_the_model_step_reports_it():
+    from mlpf.model.training import model_step
+
+    keys, slots, background = (t.clone().requires_grad_() for t in hand_grouping(background=0.0))
+    assignment_dice_loss((keys, slots, background), grouping_batch(), [(torch.tensor([0, 1]), torch.tensor([0, 1]))], chunk_size=2).backward()
+    assert all(t.grad.abs().sum() > 0 for t in (keys, slots, background))
+    batch = model_batch()
+    losses = {}
+    for weight in (0.0, 2.0):
+        torch.manual_seed(0)
+        model = MLPF(mlpf_config(hit_grouping_energy_weighted=True, hit_assignment_dice_cost=2.0, hit_grouping_dice_loss_weight=weight, **LATE))
+        loss, losses[weight], _, _, _, _ = model_step(batch, model, None, REGRESSION_WEIGHTS)
+        assert torch.isfinite(loss)
+    assert "HitDice" not in losses[0.0] and 0 < float(losses[2.0]["HitDice"]) <= 2.0
+    assert float(losses[2.0]["HitGrouping"]) == pytest.approx(float(losses[0.0]["HitGrouping"]), rel=1e-6)
+    with pytest.raises(ValueError, match="require hit_grouping"):
+        SetDecoderConfig(query_init="input-conditioned", hit_grouping_dice_loss_weight=2.0)

@@ -61,11 +61,12 @@ def _nonfinite_field_summary(values, keys):
     return "; ".join(failures) if failures else "none"
 
 
-def hungarian_match(targets, predictions, target_mask, weights=None, allow_unmatched_targets=False, num_threads=1):
+def hungarian_match(targets, predictions, target_mask, weights=None, allow_unmatched_targets=False, num_threads=1, extra_costs=None):
     """Match particle slots to targets independently for each event.
 
     allow_unmatched_targets: an event with more targets than slots leaves the extra targets unmatched instead of raising.
-    num_threads > 1 solves the per-event assignments in a thread pool; the matches are the same.
+    num_threads > 1 solves the per-event assignments in a thread pool; the matches are the same. extra_costs: optional
+    per-event [num_slots, num_valid_targets] detached costs added to the kinematic cost.
     """
 
     weights = weights or SetMatcherWeights()
@@ -85,6 +86,8 @@ def hungarian_match(targets, predictions, target_mask, weights=None, allow_unmat
         event_targets = {key: value[event_idx][valid] for key, value in targets.items()}
         event_predictions = {key: value[event_idx] for key, value in predictions.items()}
         cost = _pairwise_matching_cost(event_targets, event_predictions, weights)
+        if extra_costs is not None:
+            cost = cost + extra_costs[event_idx].to(cost)
         cost_cpu = cost.float().cpu()
         bad_cost = ~torch.isfinite(cost_cpu)
         if bad_cost.any():
@@ -235,6 +238,8 @@ def set_mlpf_loss(
     hit_grouping_detector_balanced=False,
     hit_grouping_tracker_particle_balanced=False,
     hit_grouping_energy_weighted=False,
+    hit_assignment_dice_cost=0.0,
+    hit_grouping_dice_loss_weight=0.0,
     tracker_overlap_loss_weight=0.0,
     tracker_geometry_loss_weight=0.0,
     tracker_curvature_loss_weight=0.0,
@@ -262,8 +267,17 @@ def set_mlpf_loss(
     if strict_seeding:
         seed_diagnostics = _seed_diagnostics(seed_index, is_anchor, batch, predictions["cls_binary"].shape[1])
 
+    extra_costs = None
+    if hit_assignment_dice_cost > 0 and hit_grouping is not None:
+        extra_costs = [hit_assignment_dice_cost * cost for cost in assignment_dice_costs(hit_grouping, batch, hit_grouping_chunk_size)]
     matches = hungarian_match(
-        targets, predictions, batch.target_mask, matcher_weights, allow_unmatched_targets=allow_unmatched_targets, num_threads=matching_threads
+        targets,
+        predictions,
+        batch.target_mask,
+        matcher_weights,
+        allow_unmatched_targets=allow_unmatched_targets,
+        num_threads=matching_threads,
+        extra_costs=extra_costs,
     )
 
     effective_regression_weights = regression_weights if task_loss_weighter is None else {feature: 1.0 for feature in REGRESSION_FEATURES}
@@ -311,6 +325,9 @@ def set_mlpf_loss(
         )
         losses["HitGrouping"] = hit_grouping_loss_weight * grouping_loss
         loss_opt = loss_opt + losses["HitGrouping"]
+        if hit_grouping_dice_loss_weight > 0:
+            losses["HitDice"] = hit_grouping_dice_loss_weight * assignment_dice_loss(hit_grouping, batch, matches, hit_grouping_chunk_size)
+            loss_opt = loss_opt + losses["HitDice"]
 
     if tracker_overlap_loss_weight > 0:
         if hit_grouping is None:
@@ -404,6 +421,86 @@ def _energy_weights(batch, event_idx):
     energy = x[:, 5].float().clamp_min(0.0)
     mean = energy[calo].mean() if calo.any() else energy.new_ones(())
     return torch.where(calo, energy / mean.clamp_min(1e-9), torch.ones_like(energy))
+
+
+def _calo_owner(batch, event_idx):
+    """Calorimeter elements of one event: their energy (X column 5), keys mask and owning valid-target index (-1 for none)."""
+    pn_index = Y_FEATURES.index("particle_number")
+    mask = batch.mask[event_idx].bool()
+    calo = batch.X[event_idx, mask, 0] == 2
+    energy = batch.X[event_idx, mask, 5].float().clamp_min(0.0)[calo]
+    hit_pn = batch.ytarget[event_idx, mask, pn_index].long()[calo]
+    target_pn = batch.ytarget_set[event_idx, batch.target_mask[event_idx].bool(), pn_index].long()
+    sorted_pn, order = target_pn.sort()
+    owner = torch.full_like(hit_pn, -1)
+    if sorted_pn.numel():
+        position = torch.searchsorted(sorted_pn.contiguous(), hit_pn.contiguous()).clamp_max(sorted_pn.numel() - 1)
+        owned = (hit_pn > 0) & (sorted_pn[position] == hit_pn)
+        owner[owned] = order[position[owned]]
+    return mask, calo, energy, owner, target_pn.numel()
+
+
+def assignment_dice_costs(grouping, batch, chunk_size=1024):
+    """Per event, detached [num_slots, num_valid_targets] 1 - soft Dice between each slot's share of the calorimeter
+    energy and each target's owned calorimeter energy."""
+    from mlpf.model.set_decoder import _assignment
+
+    hit_keys, slot_keys, background = grouping
+    costs = []
+    with torch.no_grad():
+        for event_idx in range(hit_keys.shape[0]):
+            mask, calo, energy, owner, num_targets = _calo_owner(batch, event_idx)
+            num_slots = slot_keys.shape[1]
+            inter = energy.new_zeros((num_targets + 1, num_slots))
+            predicted = energy.new_zeros(num_slots)
+            keys, bg = hit_keys[event_idx, mask][calo], background[event_idx, mask][calo]
+            for k, b, e, o in zip(keys.split(chunk_size), bg.split(chunk_size), energy.split(chunk_size), owner.split(chunk_size)):
+                share = _assignment(k.float(), slot_keys[event_idx].float(), b.float()) * e[:, None]
+                predicted += share.sum(dim=0)
+                inter.index_add_(0, torch.where(o >= 0, o, num_targets), share)
+            target_energy = energy.new_zeros(num_targets + 1).index_add_(0, torch.where(owner >= 0, owner, num_targets), energy)[:num_targets]
+            dice = 2.0 * inter[:num_targets].T / (predicted[:, None] + target_energy[None, :]).clamp_min(1e-9)
+            costs.append(1.0 - dice)
+    return costs
+
+
+def assignment_dice_loss(grouping, batch, matches, chunk_size=1024):
+    """Mean of 1 - soft Dice over the matched slot-target pairs whose target owns calorimeter energy, 0 without pairs.
+
+    Dice = 2 sum_h a_hs e_h y_ht / (sum_h a_hs e_h + sum_h e_h y_ht), with a the slot's share of calorimeter element h,
+    e its energy (X column 5) and y the owner label of the grouping cross-entropy (_grouping_targets).
+    """
+    from mlpf.model.set_decoder import _assignment
+
+    hit_keys, slot_keys, background = grouping
+    num_slots = slot_keys.shape[1]
+
+    def chunk_sums(keys, slots, bg, energy, labels):
+        """[2, slots]: each slot's share of the chunk's energy, and the part of it from the elements labeled with the slot."""
+        share = _assignment(keys, slots, bg) * energy[:, None]
+        own = labels < num_slots
+        inter = share.new_zeros(num_slots).index_add_(0, labels[own], share[own, labels[own]])
+        return torch.stack([share.sum(dim=0), inter])
+
+    total, pairs = slot_keys.new_zeros((), dtype=torch.float32), 0
+    for event_idx, match in enumerate(matches):
+        mask = batch.mask[event_idx].bool()
+        calo = batch.X[event_idx, mask, 0] == 2
+        energy = batch.X[event_idx, mask, 5].float().clamp_min(0.0)[calo]
+        labels = _grouping_targets(batch, event_idx, match, num_slots)[0][calo]
+        keys, bg, slots = hit_keys[event_idx, mask][calo], background[event_idx, mask][calo], slot_keys[event_idx]
+        sums = energy.new_zeros((2, num_slots))
+        for k, b, e, lab in zip(keys.split(chunk_size), bg.split(chunk_size), energy.split(chunk_size), labels.split(chunk_size)):
+            if torch.is_grad_enabled() and (k.requires_grad or slots.requires_grad or b.requires_grad):
+                sums = sums + checkpoint(chunk_sums, k, slots, b, e, lab, use_reentrant=True)
+            else:
+                sums = sums + chunk_sums(k, slots, b, e, lab)
+        own = labels < num_slots
+        target = energy.new_zeros(num_slots).index_add_(0, labels[own], energy[own])
+        use = match[0][target[match[0]] > 0]
+        total = total + (1.0 - 2.0 * sums[1, use] / (sums[0, use] + target[use]).clamp_min(1e-9)).sum()
+        pairs += len(use)
+    return total / max(pairs, 1)
 
 
 def hit_grouping_loss(

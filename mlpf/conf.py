@@ -1055,6 +1055,10 @@ class SetDecoderConfig(BaseModel):
     hit_energy_readout_detach: bool = False
     # the grouping loss weights calorimeter elements by energy over the event's mean calorimeter energy
     hit_grouping_energy_weighted: bool = False
+    # matching adds this weight x (1 - energy-weighted soft Dice) between a slot's assignment and a target's hits
+    hit_assignment_dice_cost: float = Field(default=0.0, ge=0.0)
+    # loss: this weight x mean over matched pairs of (1 - energy-weighted soft Dice) of the same assignment
+    hit_grouping_dice_loss_weight: float = Field(default=0.0, ge=0.0)
     # every track gets a slot (raises if the tracks exceed the tracker slots), and a batch raises if an event's
     # matchable targets exceed its seeded slots
     strict_seeding: bool = False
@@ -1098,8 +1102,10 @@ class SetDecoderConfig(BaseModel):
             raise ValueError("new association/readout cannot be combined with legacy tracker_group_readout")
         if self.tracker_fit_correction and not self.tracker_group_readout:
             raise ValueError("tracker_fit_correction requires tracker_group_readout")
-        if (self.hit_grouping_late or self.hit_grouping_energy_weighted) and not self.hit_grouping:
-            raise ValueError("late and energy-weighted grouping require hit_grouping")
+        if (
+            self.hit_grouping_late or self.hit_grouping_energy_weighted or self.hit_assignment_dice_cost or self.hit_grouping_dice_loss_weight
+        ) and not self.hit_grouping:
+            raise ValueError("late and energy-weighted grouping and the assignment Dice cost and loss require hit_grouping")
         if self.hit_grouping_energy_weighted and self.hit_grouping_detector_balanced:
             raise ValueError("hit_grouping_energy_weighted cannot be combined with hit_grouping_detector_balanced")
         if self.hit_energy_readout and not self.hit_grouping_late:

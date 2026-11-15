@@ -95,7 +95,7 @@ from mlpf.model.losses import (
     mlpf_loss,
     particle_loss,
 )
-from mlpf.model.set_losses import SetMatcherWeights, hungarian_match, set_mlpf_loss
+from mlpf.model.set_losses import SetMatcherWeights, assignment_dice_costs, hungarian_match, set_mlpf_loss
 from mlpf.model.reconstruction_diagnostics import compute_hit_grouping_metrics
 from mlpf.model.validation_metrics import compute_set_slot_metrics, compute_validation_particle_metrics, validation_particle_collections
 from mlpf.utils import create_comet_experiment
@@ -395,6 +395,8 @@ def _set_loss_kwargs(model_module, raw_predictions):
         "hit_grouping_detector_balanced": config.hit_grouping_detector_balanced,
         "hit_grouping_tracker_particle_balanced": config.hit_grouping_tracker_particle_balanced,
         "hit_grouping_energy_weighted": config.hit_grouping_energy_weighted,
+        "hit_assignment_dice_cost": config.hit_assignment_dice_cost,
+        "hit_grouping_dice_loss_weight": config.hit_grouping_dice_loss_weight,
         "tracker_overlap_loss_weight": config.tracker_overlap_loss_weight,
         "tracker_geometry_loss_weight": config.tracker_geometry_loss_weight,
         "tracker_curvature_loss_weight": config.tracker_curvature_loss_weight,
@@ -1044,12 +1046,18 @@ def evaluate(
                         _add_accumulator(diagnostic_accum, "metrics/set_slot/tracker_fit_fraction", fits.sum(), count=fits.numel())
                         _add_accumulator(diagnostic_accum, "metrics/set_slot/tracker_fits_per_event", fits.sum(), count=fits.shape[0])
                     if ypred_raw.hit_grouping is not None and ival < config.validation_diagnostics_batches:
+                        set_config = model_module.config.set_decoder
+                        extra_costs = None
+                        if set_config.hit_assignment_dice_cost > 0:
+                            costs = assignment_dice_costs(ypred_raw.hit_grouping, batch, set_config.hit_grouping_chunk_size)
+                            extra_costs = [set_config.hit_assignment_dice_cost * cost for cost in costs]
                         matches = hungarian_match(
                             ytarget,
                             ypred,
                             batch.target_mask,
-                            SetMatcherWeights(**model_module.config.set_decoder.matcher.model_dump()),
-                            allow_unmatched_targets=model_module.config.set_decoder.allow_unmatched_targets,
+                            SetMatcherWeights(**set_config.matcher.model_dump()),
+                            allow_unmatched_targets=set_config.allow_unmatched_targets,
+                            extra_costs=extra_costs,
                         )
                         grouping_metrics = compute_hit_grouping_metrics(
                             ypred_raw.hit_grouping,
