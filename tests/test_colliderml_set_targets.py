@@ -183,3 +183,21 @@ def test_layer_flag_validation():
         _pf_config(colliderml_data={"use_layer": True})
     config = _pf_config(colliderml_data={"use_layer": True}, model=dict(_pf_config().model.model_dump(), colliderml_input_features=True))
     assert config.input_dim == 18 and MLPFConfig.model_validate(config.model_dump()).input_dim == 18
+
+
+def test_host_class_mapping_on_every_class():
+    cls = np.array([0, 1, 2, 3, 4, 5] * 2)
+    tracked = np.array([True] * 6 + [False] * 6)
+    assert PFD.host_class(cls, tracked).tolist() == [0, 1, 1, 1, 4, 5, 0, 2, 2, 3, 3, 2]
+
+
+def test_host_class_flag_relabels_gen_target():
+    rec = make_record(n_gen=4)
+    rec["gen_target"][:, 0] = [3, 3, 1, 4]
+    rec["gen_target"][:, 8] = [0.9, 0.9, 0.0, 0.1]
+    rec["gen_target_track"] = np.array([0, -1, -1, 2], np.int32)
+    off = source([rec], set_target_source="gen_target")[0]
+    on = source([rec], set_target_source="gen_target", colliderml_data=ColliderMLDataConfig(host_class_targets=True))[0]
+    assert off["gen_target"][:, 0].tolist() == [3, 3, 1, 4]
+    assert on["gen_target"][:, 0].tolist() == [1, 3, 2, 3]
+    assert on["ytarget_set"][:, 0].tolist() == [1, 3, 2, 3]

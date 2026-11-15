@@ -1131,6 +1131,8 @@ class ColliderMLDataConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     use_layer: bool = False  # appends the calorimeter layer to X as column 17 (0 on tracks)
+    # gen_target classes forced by their host as the element targets are (PFDataset.host_class)
+    host_class_targets: bool = False
 
     @property
     def num_input_columns(self) -> int:
@@ -1556,7 +1558,7 @@ class MLPFConfig(BaseModel):
             if self.input_dim not in (base, base + flags.num_input_columns):
                 raise ValueError(f"input_dim {self.input_dim}: expected {base} + {flags.num_input_columns} colliderml_data input columns")
             self.input_dim = base + flags.num_input_columns
-        elif flags.num_input_columns:
+        elif flags.use_layer or flags.host_class_targets:
             raise ValueError("colliderml_data flags read the ColliderML v20 pf datasets")
         if flags.use_layer and not self.model.colliderml_input_features:
             raise ValueError("colliderml_data.use_layer is scaled in model.colliderml_input_features; enable it")

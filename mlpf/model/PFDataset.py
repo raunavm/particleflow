@@ -53,13 +53,32 @@ def gen_target_to_set(gen_target):
 COLLIDERML_EXTRA_KEYS = ("X_time_layer", "frac_elem", "frac_target", "frac", "X_offtrack", "offtrack_target", "offtrack_own", "extras_stored")
 
 
+HOST_TRACK_FRACTION = 0.5  # a target hosts a track when it owns the majority of its hits
+
+
+def host_class(cls, tracked):
+    """Class by host on class indices 0..5 (none, charged hadron, neutral hadron, photon, electron, muon), as the converter's
+    map_neutral_to_charged and map_charged_to_neutral do: a track-hosted photon or neutral hadron becomes a charged hadron,
+    a calorimeter-hosted electron a photon, and a calorimeter-hosted charged hadron or muon a neutral hadron."""
+    cls, tracked = np.asarray(cls), np.asarray(tracked, bool)
+    out = cls.copy()
+    out[tracked & np.isin(cls, (2, 3))] = 1
+    out[~tracked & (cls == 4)] = 3
+    out[~tracked & np.isin(cls, (1, 5))] = 2
+    return out
+
+
 def apply_colliderml_data(ret, flags, feature_dim=None):
-    """Drop the ColliderML extra fields from a record, appending the layer column to X under flags.use_layer."""
+    """Drop the ColliderML extra fields from a record and apply the colliderml_data flags."""
     extras = {k: ret.pop(k) for k in COLLIDERML_EXTRA_KEYS if k in ret}
     if flags is not None and flags.use_layer:
         if int(extras.get("extras_stored", 0)) != 1:
             raise ValueError("colliderml_data.use_layer needs a ColliderML v20 TFDS of version 1.2.0")
         ret["X"] = np.concatenate([ret["X"], extras["X_time_layer"][:, 1:2]], axis=1)
+    if flags is not None and flags.host_class_targets:
+        gen = np.array(ret["gen_target"], dtype=np.float32).reshape(-1, 10)
+        gen[:, 0] = host_class(gen[:, 0].astype(np.int64), (gen[:, 8] > HOST_TRACK_FRACTION) & (np.asarray(ret["gen_target_track"]) >= 0))
+        ret["gen_target"] = gen
     if "extras_stored" in extras and feature_dim is not None and ret["X"].shape[1] != feature_dim:
         raise ValueError(f"X has {ret['X'].shape[1]} columns after the colliderml_data flags, the model reads {feature_dim}")
     return ret
