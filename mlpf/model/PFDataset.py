@@ -49,6 +49,36 @@ def gen_target_to_set(gen_target):
     return ys
 
 
+# per-element and off-track fields of the ColliderML v20 TFDS; apply_colliderml_data keeps only what a flag reads
+COLLIDERML_EXTRA_KEYS = ("X_time_layer", "frac_elem", "frac_target", "frac", "X_offtrack", "offtrack_target", "offtrack_own", "extras_stored")
+
+
+def apply_colliderml_data(ret, flags, feature_dim=None):
+    """Drop the ColliderML extra fields from a record, appending the layer column to X under flags.use_layer."""
+    extras = {k: ret.pop(k) for k in COLLIDERML_EXTRA_KEYS if k in ret}
+    if flags is not None and flags.use_layer:
+        if int(extras.get("extras_stored", 0)) != 1:
+            raise ValueError("colliderml_data.use_layer needs a ColliderML v20 TFDS of version 1.2.0")
+        ret["X"] = np.concatenate([ret["X"], extras["X_time_layer"][:, 1:2]], axis=1)
+    if "extras_stored" in extras and feature_dim is not None and ret["X"].shape[1] != feature_dim:
+        raise ValueError(f"X has {ret['X'].shape[1]} columns after the colliderml_data flags, the model reads {feature_dim}")
+    return ret
+
+
+def colliderml_skipped_keys(flags, feature_keys):
+    """The extra fields among feature_keys that no colliderml_data flag reads; they are not parsed."""
+    read = {"extras_stored"} | ({"X_time_layer"} if flags is not None and flags.use_layer else set())
+    return tuple(k for k in COLLIDERML_EXTRA_KEYS if k in feature_keys and k not in read)
+
+
+def skipping_reader(features, skip, decoders=None):
+    """(parser, decoders) that read a record without the features in skip, which come back as None."""
+    from tensorflow_datasets.core import example_parser
+
+    specs = {k: v for k, v in features.get_serialized_info().items() if k not in skip}
+    return example_parser.ExampleParserNp(specs), {**(decoders or {}), **{k: tfds.decode.SkipDecoding() for k in skip}}
+
+
 def uses_hit_grouping(config):
     """Set output with hit grouping, the only reader of the element particle_number in training."""
     set_decoder = config.model.set_decoder
@@ -96,6 +126,7 @@ class TFDSDataSource:
         build_target_set=False,
         set_target_source="element_rows",
         align_particle_numbers=False,
+        colliderml_data=None,
     ):
         self.ds = ds
         tmp = self.ds.dataset_info
@@ -110,6 +141,10 @@ class TFDSDataSource:
         self.build_target_set = build_target_set
         self.set_target_source = set_target_source
         self.align_particle_numbers = align_particle_numbers
+        self.colliderml_data = colliderml_data
+        feature_keys = tmp.features.keys() if hasattr(tmp.features, "keys") else ()
+        self.skip_keys = colliderml_skipped_keys(colliderml_data, feature_keys)
+        self._reader = None
 
     def _close_extra_readers(self):
         # ArrayRecordDataSource caches one reader per shard file forever, so the
@@ -138,12 +173,20 @@ class TFDSDataSource:
         records = self.ds.data_source.__getitems__(item)
         self._close_extra_readers()
 
-        ret = [self.ds.dataset_info.features.deserialize_example_np(record, decoders=self.ds.decoders) for record in records]
+        features = self.ds.dataset_info.features
+        if self.skip_keys:
+            if self._reader is None:
+                self._reader = skipping_reader(features, self.skip_keys, self.ds.decoders)
+            parser, decoders = self._reader
+            ret = [features.decode_example_np(parser.parse_example(record), decoders=decoders) for record in records]
+        else:
+            ret = [features.deserialize_example_np(record, decoders=self.ds.decoders) for record in records]
         assert len(ret) == 1
         ret = ret[0]
         ds_name = self.ds.dataset_info.name
         ret["source_id"] = np.int64(dataset_source_id(ds_name))
         ret["input_type_id"] = np.int64(dataset_input_type_id(ds_name))
+        apply_colliderml_data(ret, self.colliderml_data, self.feature_dim)
 
         Xshape = ret["X"].shape
         _logger.debug(f"Getting item={item}, ds={ds_name}:{self.ds.dataset_info.config_name}, X={Xshape}")
@@ -286,6 +329,7 @@ class PFDataset:
         build_target_set=False,
         set_target_source="element_rows",
         align_particle_numbers=False,
+        colliderml_data=None,
     ):
         """
         Args
@@ -315,6 +359,7 @@ class PFDataset:
             build_target_set=build_target_set,
             set_target_source=set_target_source,
             align_particle_numbers=align_particle_numbers,
+            colliderml_data=colliderml_data,
         )
 
         if num_samples and num_samples < len(self.ds):
@@ -882,6 +927,7 @@ def get_interleaved_dataloaders(world_size, rank, config: MLPFConfig, use_cuda, 
                         build_target_set=config.model.output_mode == OutputMode.SET,
                         set_target_source=config.set_target_source,
                         align_particle_numbers=uses_hit_grouping(config),
+                        colliderml_data=config.colliderml_data,
                     ).ds
 
                     if (rank == 0) or (rank == "cpu"):

@@ -260,6 +260,19 @@ def test_tfds_build(tmp_path):
     r = ds[0]
     assert r["gen_target"].shape == (2, 10) and r["X"].shape == (2, 17)
     assert r["X_time_layer"].shape == (2, 2) and r["X_offtrack"].shape == (2, 11) and r["extras_stored"] == 1
+
+    from mlpf.conf import ColliderMLDataConfig
+    from mlpf.model.PFDataset import TFDSDataSource
+
+    builder = tfds.builder_from_directory(str(data_dir / "colliderml_ttbar_pu0_v20_pf" / "r2" / version))
+    plain = TFDSDataSource(builder.as_data_source(split="test"), sort=False, pad_to_multiple=None, feature_dim=17)
+    layer = TFDSDataSource(
+        builder.as_data_source(split="test"), sort=False, pad_to_multiple=None, feature_dim=18, colliderml_data=ColliderMLDataConfig(use_layer=True)
+    )
+    assert len(plain.skip_keys) == 7 and len(layer.skip_keys) == 6
+    a, b = plain[0], layer[0]
+    np.testing.assert_array_equal(b["X"][:, :17], a["X"])
+    assert "X_offtrack" not in a and "X_time_layer" not in b
     assert set(r["gen_target"][:, 0].tolist()) <= {1.0, 2.0, 3.0, 4.0, 5.0}
 
 

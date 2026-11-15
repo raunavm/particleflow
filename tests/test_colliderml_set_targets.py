@@ -5,14 +5,16 @@ import numpy as np
 import pytest
 import torch
 
-from mlpf.conf import Y_FEATURES, MLPFConfig
-from mlpf.model.PFDataset import TFDSDataSource, align_particle_numbers, gen_target_to_set
+import mlpf.model.PFDataset as PFD
+from mlpf.conf import Y_FEATURES, ColliderMLDataConfig, MLPFConfig
+from mlpf.model.input_features import ColliderMLInputFeatures
+from mlpf.model.PFDataset import COLLIDERML_EXTRA_KEYS, TFDSDataSource, align_particle_numbers, gen_target_to_set
 from mlpf.model.utils import unpack_target
 
 DS_NAME = "colliderml_ttbar_pu0_v20_pf"
 
 
-def make_record(seed=0, n_trk=3, n_calo=6, n_gen=4):
+def make_record(seed=0, n_trk=3, n_calo=6, n_gen=4, extras=False):
     rng = np.random.default_rng(seed)
     n = n_trk + n_calo
     X = rng.random((n, 17)).astype(np.float32)
@@ -24,7 +26,7 @@ def make_record(seed=0, n_trk=3, n_calo=6, n_gen=4):
     gen = rng.random((n_gen, 10)).astype(np.float32) + 0.1
     gen[:, 0] = rng.integers(1, 6, n_gen)
     gen[:, 7] = rng.integers(0, 2, n_gen)
-    return {
+    rec = {
         "X": X,
         "ytarget": ytarget,
         "ycand": np.zeros_like(ytarget),
@@ -33,6 +35,20 @@ def make_record(seed=0, n_trk=3, n_calo=6, n_gen=4):
         "gen_target": gen,
         "gen_target_track": np.full(n_gen, -1, np.int32),
     }
+    if extras:
+        layer = np.zeros((n, 2), np.float32)
+        layer[n_trk:, 1] = np.arange(n_calo)
+        rec.update(
+            X_time_layer=layer,
+            frac_elem=np.arange(n_calo, dtype=np.int32) + n_trk,
+            frac_target=np.zeros(n_calo, np.int32),
+            frac=np.ones(n_calo, np.float32),
+            X_offtrack=np.zeros((2, 11), np.float32),
+            offtrack_target=np.zeros(2, np.int32),
+            offtrack_own=np.zeros(2, np.int32),
+            extras_stored=np.int32(1),
+        )
+    return rec
 
 
 class _Features:
@@ -51,8 +67,8 @@ class _TFDS:
         return self.n
 
 
-def source(records, **kwargs):
-    return TFDSDataSource(_TFDS(records), sort=False, pad_to_multiple=None, feature_dim=17, build_target_set=True, **kwargs)
+def source(records, feature_dim=17, **kwargs):
+    return TFDSDataSource(_TFDS(records), sort=False, pad_to_multiple=None, feature_dim=feature_dim, build_target_set=True, **kwargs)
 
 
 def test_gen_target_set_columns_round_trip_through_unpack_target():
@@ -125,3 +141,45 @@ def test_set_output_accepted_on_v20_pf_datasets_only():
         _pf_config(sample="colliderml_ttbar_nopu_pf")
     with pytest.raises(ValueError, match="ColliderML pf datasets"):
         _pf_config(test_dataset={"colliderml_ttbar_nopu_pf": {"version": "1.5.0"}})
+
+
+def test_layer_column_and_extras_are_dropped_unless_asked_for():
+    rec = make_record(extras=True)
+    plain = source([rec], set_target_source="gen_target")[0]
+    assert not set(COLLIDERML_EXTRA_KEYS) & set(plain) and plain["X"].shape[1] == 17
+    got = source([rec], set_target_source="gen_target", colliderml_data=ColliderMLDataConfig(use_layer=True), feature_dim=18)[0]
+    np.testing.assert_array_equal(got["X"][:, :17], plain["X"])
+    assert got["X"][:, 17].tolist() == [0, 0, 0, 0, 1, 2, 3, 4, 5]
+    with pytest.raises(ValueError, match="model reads 18"):
+        source([rec], set_target_source="gen_target", feature_dim=18)[0]
+    with pytest.raises(ValueError, match="version 1.2.0"):
+        source([make_record()], set_target_source="gen_target", colliderml_data=ColliderMLDataConfig(use_layer=True), feature_dim=18)[0]
+
+
+def test_unread_extras_are_not_parsed():
+    keys = list(make_record(extras=True))
+    unread = ("X_time_layer", "frac_elem", "frac_target", "frac", "X_offtrack", "offtrack_target", "offtrack_own")
+    assert PFD.colliderml_skipped_keys(None, keys) == unread
+    assert PFD.colliderml_skipped_keys(ColliderMLDataConfig(use_layer=True), keys) == unread[1:]
+    assert PFD.colliderml_skipped_keys(None, list(make_record())) == ()
+
+
+def test_layer_input_feature():
+    calo = [2.0, 0.5, 0.3, 0.0, 1.0, 0.5, 1500.0, 0.0, 400.0, 0.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+    hcal = list(calo)
+    hcal[10], hcal[11] = 0.0, 0.5
+    track = [1.0, 5.0, 0.5, 0.0, 1.0, 5.6, 0.02, 30.0, 1.1, 0.1, 0.5, 0.001, 33.0, 12.0, 0.0, 0.0, 0.0]
+    X = torch.tensor([[calo + [24.0], hcal + [18.0], track + [9.0], [0.0] * 18]])
+    plain, layer = ColliderMLInputFeatures(), ColliderMLInputFeatures(use_layer=True)
+    ref, out = plain(X[..., :17]), layer(X)
+    nb = plain.NUM_BASE
+    assert out.shape[-1] == plain.num_output_features + 1
+    assert torch.equal(out[..., :nb], ref[..., :nb]) and torch.equal(out[..., nb + 1 :], ref[..., nb:])
+    assert out[0, :, nb].tolist() == pytest.approx([0.5, 0.5, 0.0, 0.0])  # ECAL 24 / 48, HCAL 18 / 36
+
+
+def test_layer_flag_validation():
+    with pytest.raises(ValueError, match="colliderml_input_features"):
+        _pf_config(colliderml_data={"use_layer": True})
+    config = _pf_config(colliderml_data={"use_layer": True}, model=dict(_pf_config().model.model_dump(), colliderml_input_features=True))
+    assert config.input_dim == 18 and MLPFConfig.model_validate(config.model_dump()).input_dim == 18

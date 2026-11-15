@@ -1125,6 +1125,18 @@ class TaskLossWeights(BaseModel):
         return self
 
 
+class ColliderMLDataConfig(BaseModel):
+    """Fields of the ColliderML v20 TFDS that reach the model; all off gives the records of the 1.0.0 builds."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    use_layer: bool = False  # appends the calorimeter layer to X as column 17 (0 on tracks)
+
+    @property
+    def num_input_columns(self) -> int:
+        return int(self.use_layer)
+
+
 class LRFinderConfig(BaseModel):
     """LR range test (`mlpf/pipeline.py lr-find`): exponential lr ramp, loss recorded per step."""
 
@@ -1427,6 +1439,7 @@ class MLPFConfig(BaseModel):
     sampler_mode: DatasetSamplerMode = DatasetSamplerMode.SHARD_CONSECUTIVE  # use interleaved-shards for groups of several samples
     # set-output targets: the representative element rows of ytarget, or the gen_target rows of the record
     set_target_source: Literal["element_rows", "gen_target"] = "element_rows"
+    colliderml_data: ColliderMLDataConfig = Field(default_factory=ColliderMLDataConfig)
     load: Optional[str] = None  # path to model and optimizer checkpoint to load
     relaxed_load: bool = False  # if enabled, skip layer mismatch and optimizer in loading
     load_weights_only: bool = False  # load only the model weights from --load; optimizer, LR schedule, RNG, sampler and step start fresh
@@ -1533,6 +1546,21 @@ class MLPFConfig(BaseModel):
             if version is not None and versions.setdefault(dataset, version) != version:
                 raise ValueError(f"{dataset} samples have versions {versions[dataset]} and {version}")
         return versions
+
+    @model_validator(mode="after")
+    def validate_colliderml_data(self) -> "MLPFConfig":
+        flags = self.colliderml_data
+        if self.dataset == Dataset.COLLIDERML:
+            # input_dim counts the appended columns; a dumped config validates again unchanged
+            base = len(X_FEATURES[self.dataset.value])
+            if self.input_dim not in (base, base + flags.num_input_columns):
+                raise ValueError(f"input_dim {self.input_dim}: expected {base} + {flags.num_input_columns} colliderml_data input columns")
+            self.input_dim = base + flags.num_input_columns
+        elif flags.num_input_columns:
+            raise ValueError("colliderml_data flags read the ColliderML v20 pf datasets")
+        if flags.use_layer and not self.model.colliderml_input_features:
+            raise ValueError("colliderml_data.use_layer is scaled in model.colliderml_input_features; enable it")
+        return self
 
     @model_validator(mode="after")
     def validate_dataset_weights(self) -> "MLPFConfig":

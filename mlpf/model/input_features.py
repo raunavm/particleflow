@@ -5,6 +5,9 @@ radiusOfInnermostHit, n_meas; calorimeter elements: type, et, eta, sin_phi, cos_
 E_other, num_hits, sigma_x, sigma_y, sigma_z) mix millimeters and GeV. This module puts every column on a scale near 1
 and adds Fourier features of eta, phi and the distance from the origin. It runs in fp32 under autocast. The raw
 X_features still reach seeding, the heads and the element-type masks.
+
+With use_layer, X column 17 holds the calorimeter layer of the element, scaled by the number of layers of the
+calorimeter with more energy.
 """
 
 import math
@@ -14,6 +17,7 @@ from torch import nn
 
 HCAL_SATURATION_GEV = 0.6
 ECAL_CLIP_GEV = 9.68
+ECAL_LAYERS, HCAL_LAYERS = 48, 36
 
 
 def _log(v, floor=1e-4):
@@ -24,9 +28,10 @@ class ColliderMLInputFeatures(nn.Module):
     NUM_BASE = 21
     NUM_BANDS = 8  # per coordinate: phi, eta, distance
 
-    def __init__(self):
+    def __init__(self, use_layer=False):
         super().__init__()
-        self.num_output_features = self.NUM_BASE + 2 * 3 * self.NUM_BANDS
+        self.use_layer = bool(use_layer)
+        self.num_output_features = self.NUM_BASE + int(self.use_layer) + 2 * 3 * self.NUM_BANDS
         bands = 2.0 ** torch.arange(1, self.NUM_BANDS + 1, dtype=torch.float32)
         self.register_buffer("phi_freq", bands, persistent=False)
         self.register_buffer("eta_freq", math.pi * bands / 2.5, persistent=False)
@@ -70,6 +75,9 @@ class ColliderMLInputFeatures(nn.Module):
                 cal * ecal_clip.float(),
                 radius,
             ]
+            if self.use_layer:
+                hcal = x[..., 11] > x[..., 10]
+                columns.append(cal * torch.where(hcal, x[..., 17] / HCAL_LAYERS, x[..., 17] / ECAL_LAYERS))
             angles = torch.cat(
                 [phi.unsqueeze(-1) * self.phi_freq, x[..., 2:3] * self.eta_freq, radius.unsqueeze(-1) * self.radius_freq],
                 dim=-1,

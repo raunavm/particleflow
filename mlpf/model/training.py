@@ -1682,6 +1682,7 @@ def run_test(rank, world_size, config: MLPFConfig, outdir, model, sample, testdi
             build_target_set=config.model.output_mode == OutputMode.SET,
             set_target_source=config.set_target_source,
             align_particle_numbers=uses_hit_grouping(config),
+            colliderml_data=config.colliderml_data,
         ).ds
         dataset.append(ds)
     ds = torch.utils.data.ConcatDataset(dataset)
