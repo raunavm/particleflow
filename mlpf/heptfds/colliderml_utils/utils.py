@@ -178,6 +178,14 @@ def generate_examples(files: List[Path]):
 # Configs 1-10 each take 1/10 of the train shards, config 1 also holds test and config 2 val_read.
 # Configs r1-r10 hold one report shard each as test.
 V20_PU0_LAYOUT = {"train": (0, 7679), "test": (7680, 8319), "val_read": (8320, 8959), "report": (8960, 10239), "n_report": 10}
+# PU200 v22: the first 1,024 events keep their v20 splits, later events extend train, validation and report.
+V22_PU200_LAYOUT = {
+    "train": [(0, 639), (1664, 10047)],
+    "test": [(640, 703), (1408, 1535)],
+    "val_read": [(704, 767), (1536, 1663)],
+    "report": (768, 1407),
+    "n_report": 8,
+}
 V20_RANGES = ("train", "test", "val_read", "report")
 N_V20_TRAIN_CONFIGS = 10
 V20_COLUMNS = [
@@ -203,10 +211,14 @@ V20_COLUMNS = [
 N_OFFTRACK_FEATURES = 11  # postprocessing.OFFTRACK_FEATURES
 
 
+def _ranges(entry):
+    """A layout entry as a list of (first, last) event id ranges."""
+    return [entry] if isinstance(entry, tuple) else entry
+
+
 def _in_range(ids, entry):
-    lo, hi = entry
     ids = np.asarray(ids, np.int64)
-    return (ids >= lo) & (ids <= hi)
+    return np.any([(ids >= lo) & (ids <= hi) for lo, hi in _ranges(entry)], axis=0)
 
 
 def v20_config_names(layout):
@@ -251,8 +263,8 @@ def assert_v20_splits(config, ids_by_split, layout):
         if not _in_range(ids, entry).all():
             raise ValueError(f"config {config} {split}: event ids {ids.min()}-{ids.max()} outside {entry}")
     if config == "1":
-        lo, hi = layout["test"]
-        if not np.array_equal(np.sort(np.asarray(ids_by_split["test"], np.int64)), np.arange(lo, hi + 1)):
+        want = np.concatenate([np.arange(lo, hi + 1) for lo, hi in _ranges(layout["test"])])
+        if not np.array_equal(np.sort(np.asarray(ids_by_split["test"], np.int64)), want):
             raise ValueError(f"config 1 test is not exactly the event ids {layout['test']}")
 
 
@@ -385,3 +397,41 @@ def generate_examples_v20(files: List[Path]):
                     **extras,
                 },
             )
+
+
+# PU200 v22 training blocks: one config per 100-event source file, holding its train ids beyond the first 1,024 events
+V22_BLOCK_EVENTS = 100
+V22_LAST_EVENT = 10047
+
+
+def v22_block_config_names(layout):
+    """e01600, e01700, ... e10000."""
+    lo = min(a for a, _ in _ranges(layout["train"]) if a >= 1024)
+    return [f"e{f:05d}" for f in range(lo // V22_BLOCK_EVENTS * V22_BLOCK_EVENTS, V22_LAST_EVENT + 1, V22_BLOCK_EVENTS)]
+
+
+def v22_block_ids(config, layout):
+    """The train event ids of one block config."""
+    if config not in v22_block_config_names(layout):
+        raise ValueError(f"unknown block config {config}")
+    first = int(config[1:])
+    ids = np.arange(first, min(first + V22_BLOCK_EVENTS - 1, V22_LAST_EVENT) + 1)
+    return ids[_in_range(ids, layout["train"])]
+
+
+def v22_block_files(file_ids, layout, config):
+    """The files of one block config in event-id order; they must hold exactly the block's train ids, each once."""
+    want = v22_block_ids(config, layout)
+    got = np.concatenate([np.asarray(v, np.int64) for v in file_ids.values()]) if file_ids else np.zeros(0, np.int64)
+    if len(np.unique(got)) != len(got):
+        raise ValueError(f"config {config}: an event id appears more than once across files")
+    if not np.array_equal(np.sort(got), want):
+        raise ValueError(f"config {config}: files hold {len(got)} event ids, expected exactly {want[0]}-{want[-1]} ({len(want)})")
+    return sorted(file_ids, key=lambda f: int(np.min(file_ids[f])))
+
+
+def split_sample_v22_block(path, config, layout):
+    """The train example generator of one block config."""
+    files = v22_block_files(v20_file_event_ids(path), layout, config)
+    print(f"config {config} train: {[Path(f).name for f in files]}")
+    return {"train": generate_examples_v20(files)}

@@ -137,7 +137,10 @@ FEATURES_1_2_0 = {
     "offtrack_own": ((None,), "int32"),
     "extras_stored": ((), "int32"),
 }
-BUILDERS = [("ttbar_pu0_v20", "CollidermlTtbarPu0V20Pf", "colliderml_ttbar_pu0_v20_pf", "1")]
+BUILDERS = [
+    ("ttbar_pu0_v20", "CollidermlTtbarPu0V20Pf", "colliderml_ttbar_pu0_v20_pf", "1"),
+    ("ttbar_pu200_v22_blocks", "CollidermlTtbarPu200V22PfBlocks", "colliderml_ttbar_pu200_v22_pf_blocks", "e03200"),
+]
 
 
 @pytest.mark.parametrize("module,cls,name,config", BUILDERS)
@@ -258,3 +261,27 @@ def test_tfds_build(tmp_path):
     assert r["gen_target"].shape == (2, 10) and r["X"].shape == (2, 17)
     assert r["X_time_layer"].shape == (2, 2) and r["X_offtrack"].shape == (2, 11) and r["extras_stored"] == 1
     assert set(r["gen_target"][:, 0].tolist()) <= {1.0, 2.0, 3.0, 4.0, 5.0}
+
+
+def test_v22_blocks_cover_the_train_ids_exactly_once():
+    L22 = U.V22_PU200_LAYOUT
+    names = U.v22_block_config_names(L22)
+    assert names[0] == "e01600" and names[-1] == "e10000" and len(names) == 85
+    ids = np.concatenate([U.v22_block_ids(n, L22) for n in names])
+    assert np.array_equal(ids, np.arange(1664, 10048))
+    for r in ("test", "val_read", "report"):
+        assert not U._in_range(ids, L22[r]).any()
+    assert len(U.v22_block_ids("e01600", L22)) == 36 and len(U.v22_block_ids("e10000", L22)) == 48
+    with pytest.raises(ValueError):
+        U.v22_block_ids("e01500", L22)
+
+
+def test_v22_block_files_need_exactly_the_block_ids():
+    L22 = U.V22_PU200_LAYOUT
+    a, b = np.arange(3200, 3250), np.arange(3250, 3300)
+    assert U.v22_block_files({"b": b, "a": a}, L22, "e03200") == ["a", "b"]
+    for bad in ({"a": a}, {"a": a, "b": b[:-1]}, {"a": a, "b": np.arange(3250, 3301)}, {"a": a, "b": b, "c": a[:1]}, {}):
+        with pytest.raises(ValueError):
+            U.v22_block_files(bad, L22, "e03200")
+    with pytest.raises(ValueError):
+        U.v22_block_files({"a": np.arange(1600, 1700)}, L22, "e01600")  # 1600-1663 are validation ids
