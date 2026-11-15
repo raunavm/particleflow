@@ -234,6 +234,7 @@ def set_mlpf_loss(
     hit_grouping_background_weight=0.1,
     hit_grouping_detector_balanced=False,
     hit_grouping_tracker_particle_balanced=False,
+    hit_grouping_energy_weighted=False,
     tracker_overlap_loss_weight=0.0,
     tracker_geometry_loss_weight=0.0,
     tracker_curvature_loss_weight=0.0,
@@ -306,6 +307,7 @@ def set_mlpf_loss(
             background_weight=hit_grouping_background_weight,
             detector_balanced=hit_grouping_detector_balanced,
             tracker_particle_balanced=hit_grouping_tracker_particle_balanced,
+            energy_weighted=hit_grouping_energy_weighted,
         )
         losses["HitGrouping"] = hit_grouping_loss_weight * grouping_loss
         loss_opt = loss_opt + losses["HitGrouping"]
@@ -395,8 +397,22 @@ def _grouping_targets(batch, event_idx, match, num_slots):
     return labels, charged
 
 
-def hit_grouping_loss(grouping, batch, matches, chunk_size=1024, background_weight=0.1, detector_balanced=False, tracker_particle_balanced=False):
-    """Supervise event-local hit ownership without a dense hit-pair matrix."""
+def _energy_weights(batch, event_idx):
+    """Per valid element: calorimeter energy over the event's mean calorimeter energy, 1 for other elements."""
+    x = batch.X[event_idx, batch.mask[event_idx].bool()]
+    calo = x[:, 0] == 2
+    energy = x[:, 5].float().clamp_min(0.0)
+    mean = energy[calo].mean() if calo.any() else energy.new_ones(())
+    return torch.where(calo, energy / mean.clamp_min(1e-9), torch.ones_like(energy))
+
+
+def hit_grouping_loss(
+    grouping, batch, matches, chunk_size=1024, background_weight=0.1, detector_balanced=False, tracker_particle_balanced=False, energy_weighted=False
+):
+    """Supervise event-local hit ownership without a dense hit-pair matrix.
+
+    energy_weighted multiplies each element's weight by its calorimeter energy over the event mean (_energy_weights).
+    """
     hit_keys, slot_keys, background = grouping
     num_slots = slot_keys.shape[1]
     pn_index = Y_FEATURES.index("particle_number")
@@ -431,11 +447,13 @@ def hit_grouping_loss(grouping, batch, matches, chunk_size=1024, background_weig
     for event_idx, (slot_indices, target_indices) in enumerate(matches):
         hit_mask = batch.mask[event_idx].bool()
         labels, _ = _grouping_targets(batch, event_idx, (slot_indices, target_indices), num_slots)
-        weight_sum = weight_sum + torch.where(labels == num_slots, background_weight, 1.0).sum()
+        hit_weights = torch.where(labels == num_slots, background_weight, 1.0)
+        if energy_weighted:
+            hit_weights = hit_weights * _energy_weights(batch, event_idx).to(hit_weights)
+        weight_sum = weight_sum + hit_weights.sum()
         event_hit_keys = hit_keys[event_idx, hit_mask]
         event_background = background[event_idx, hit_mask]
         event_slot_keys = slot_keys[event_idx]
-        hit_weights = torch.where(labels == num_slots, background_weight, 1.0)
         if tracker_particle_balanced:
             counts, selected = tracker_counts[event_idx]
             # Redistribute the original charged-tracker foreground weight, keeping
@@ -453,9 +471,10 @@ def hit_grouping_loss(grouping, batch, matches, chunk_size=1024, background_weig
         ):
 
             def chunk_loss(keys, slots, bg, targets, weights):
-                scores = torch.cat([10.0 * (keys @ slots.T), bg], dim=-1)
-                per_hit = F.cross_entropy(scores, targets, reduction="none")
-                return (per_hit * weights).sum()
+                with torch.autocast(device_type=keys.device.type, enabled=False):
+                    scores = torch.cat([10.0 * (keys.float() @ slots.float().T), bg.float()], dim=-1)
+                    per_hit = F.cross_entropy(scores, targets, reduction="none")
+                    return (per_hit * weights).sum()
 
             if torch.is_grad_enabled() and (keys_chunk.requires_grad or event_slot_keys.requires_grad or background_chunk.requires_grad):
                 # Reentrant checkpointing discards the chunk's CE activations;

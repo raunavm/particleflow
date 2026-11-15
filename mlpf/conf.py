@@ -1046,6 +1046,13 @@ class SetDecoderConfig(BaseModel):
     allow_unmatched_targets: bool = False
     # threads for the per-event Hungarian assignments
     matching_threads: int = Field(default=1, ge=1)
+    # the hit-to-slot assignment is read from the final decoder slots, and nothing is pooled back into them
+    hit_grouping_late: bool = False
+    # slot energy = assigned ECAL + HCAL energy x exp(learned correction) for every slot not seeded on a track, and
+    # pt from it with a learned neutral-hadron mass; ColliderML layout only
+    hit_energy_readout: bool = False
+    # the grouping loss weights calorimeter elements by energy over the event's mean calorimeter energy
+    hit_grouping_energy_weighted: bool = False
     # every track gets a slot (raises if the tracks exceed the tracker slots), and a batch raises if an event's
     # matchable targets exceed its seeded slots
     strict_seeding: bool = False
@@ -1089,6 +1096,14 @@ class SetDecoderConfig(BaseModel):
             raise ValueError("new association/readout cannot be combined with legacy tracker_group_readout")
         if self.tracker_fit_correction and not self.tracker_group_readout:
             raise ValueError("tracker_fit_correction requires tracker_group_readout")
+        if (self.hit_grouping_late or self.hit_grouping_energy_weighted) and not self.hit_grouping:
+            raise ValueError("late and energy-weighted grouping require hit_grouping")
+        if self.hit_grouping_energy_weighted and self.hit_grouping_detector_balanced:
+            raise ValueError("hit_grouping_energy_weighted cannot be combined with hit_grouping_detector_balanced")
+        if self.hit_energy_readout and not self.hit_grouping_late:
+            raise ValueError("hit_energy_readout requires hit_grouping_late")
+        if self.hit_grouping_late and (self.hit_grouping_sparse or self.tracker_momentum_readout or self.tracker_group_readout):
+            raise ValueError("hit_grouping_late pools nothing into the slots: no sparse association or tracker readouts")
         if (self.strict_seeding or self.anchor_mode != "none") and self.query_init != SetQueryInit.INPUT_CONDITIONED:
             raise ValueError("set decoder strict_seeding and anchor_mode require query_init='input-conditioned'")
         return self
@@ -1585,6 +1600,9 @@ class MLPFConfig(BaseModel):
             raise ValueError("colliderml_data flags read the ColliderML v20 pf datasets")
         if flags.use_layer and not self.model.colliderml_input_features:
             raise ValueError("colliderml_data.use_layer is scaled in model.colliderml_input_features; enable it")
+        set_decoder = self.model.set_decoder
+        if set_decoder is not None and set_decoder.hit_energy_readout and self.dataset != Dataset.COLLIDERML:
+            raise ValueError("hit_energy_readout reads the ColliderML element layout")
         return self
 
     @model_validator(mode="after")

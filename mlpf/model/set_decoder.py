@@ -6,6 +6,7 @@ from typing import overload
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from mlpf.logger import _logger
 from mlpf.model.tracker_group_readout import SUMMARY_DIM, tracker_group_geometry
@@ -43,6 +44,8 @@ class ParticleSetDecoderOutput(Sequence[torch.Tensor]):
     # input-conditioned queries: [batch, slots] element that seeded each slot (-1 = none), and the energy-anchor slots
     seed_index: torch.Tensor | None = None
     is_anchor: torch.Tensor | None = None
+    # hit_energy_readout: [batch, slots, 2] ECAL and HCAL energy assigned to each slot by the final layer
+    hit_energy: torch.Tensor | None = None
 
     @overload
     def __getitem__(self, index: int) -> torch.Tensor: ...
@@ -273,6 +276,40 @@ class SectorizedParticleSetDecoderLayer(ParticleSetDecoderLayer):
         return slots + self.ffn(self.ffn_norm(slots))
 
 
+ASSIGNMENT_SCALE = 10.0  # cosine-similarity logit scale, as in hit_grouping_loss
+
+
+def _assignment(keys, slots, background):
+    """[hits, slots] softmax share of each hit over the slots plus background (the background share dropped), in fp32."""
+    with torch.autocast(device_type=keys.device.type, enabled=False):
+        logits = ASSIGNMENT_SCALE * (keys.float() @ slots.float().T)
+        return torch.softmax(torch.cat([logits, background.float()], dim=-1), dim=-1)[:, :-1]
+
+
+def _assigned_chunk(keys, slots, background, energy):
+    with torch.autocast(device_type=keys.device.type, enabled=False):
+        return _assignment(keys, slots, background).T @ energy.float()
+
+
+def assigned_energy(grouping, memory_mask, input_features, chunk_size):
+    """[batch, slots, 2] ECAL and HCAL energy (ColliderML columns 10 and 11) of the calorimeter elements, split by each
+    element's softmax over slots plus background. Linear memory in the elements: chunks are recomputed in backward."""
+    hit_keys, slot_keys, background = grouping
+    out = []
+    for event_idx in range(hit_keys.shape[0]):
+        calo = memory_mask[event_idx].bool() & (input_features[event_idx, :, 0] == 2)
+        energy = input_features[event_idx][calo][:, 10:12].float().clamp_min(0.0)
+        keys, bg = hit_keys[event_idx][calo], background[event_idx][calo]
+        total = slot_keys.new_zeros((slot_keys.shape[1], 2), dtype=torch.float32)
+        for k, b, e in zip(keys.split(chunk_size), bg.split(chunk_size), energy.split(chunk_size)):
+            if torch.is_grad_enabled() and (k.requires_grad or slot_keys.requires_grad):
+                total = total + checkpoint(_assigned_chunk, k, slot_keys[event_idx], b, e, use_reentrant=True)
+            else:
+                total = total + _assigned_chunk(k, slot_keys[event_idx], b, e)
+        out.append(total)
+    return torch.stack(out)
+
+
 class ParticleSetDecoder(nn.Module):
     """Decode learned or detector-seeded queries into an unordered particle set."""
 
@@ -304,6 +341,8 @@ class ParticleSetDecoder(nn.Module):
         self.hit_grouping_sparse = config.hit_grouping_sparse
         self.hit_grouping_topk = config.hit_grouping_topk
         self.hit_grouping_temperature = config.hit_grouping_temperature
+        self.hit_grouping_late = config.hit_grouping_late
+        self.hit_energy_readout = config.hit_energy_readout
         self.tracker_momentum_readout = config.tracker_momentum_readout
         self.tracker_group_readout = config.tracker_group_readout
         self.tracker_fit_correction = config.tracker_fit_correction
@@ -322,9 +361,20 @@ class ParticleSetDecoder(nn.Module):
             self.hit_grouping_hit = nn.Linear(embedding_dim, config.hit_grouping_dim)
             self.hit_grouping_slot = nn.Linear(embedding_dim, config.hit_grouping_dim)
             self.hit_grouping_background = nn.Linear(embedding_dim, 1)
-            self.hit_grouping_projection = nn.Linear(2 * embedding_dim + 3, embedding_dim)
-            nn.init.zeros_(self.hit_grouping_projection.weight)
-            nn.init.zeros_(self.hit_grouping_projection.bias)
+            if not self.hit_grouping_late:
+                self.hit_grouping_projection = nn.Linear(2 * embedding_dim + 3, embedding_dim)
+                nn.init.zeros_(self.hit_grouping_projection.weight)
+                nn.init.zeros_(self.hit_grouping_projection.bias)
+            else:
+                # learned scale of the late assignment logits, folded into the slot keys
+                self.assignment_log_scale = nn.Parameter(torch.zeros(1))
+        if self.hit_energy_readout:
+            # log-energy correction on top of the assigned ECAL + HCAL energy, zero at initialization
+            self.energy_correction = nn.Sequential(nn.Linear(embedding_dim + 3, embedding_dim), nn.GELU(), nn.Linear(embedding_dim, 1))
+            nn.init.zeros_(self.energy_correction[-1].weight)
+            nn.init.zeros_(self.energy_correction[-1].bias)
+            # neutral-hadron mass of the readout pt, 0.7 GeV x exp(this); other classes are massless
+            self.readout_log_mass = nn.Parameter(torch.zeros(1))
         if self.tracker_group_readout:
             self.tracker_group_projection = nn.Linear(SUMMARY_DIM, embedding_dim)
             nn.init.zeros_(self.tracker_group_projection.weight)
@@ -635,7 +685,42 @@ class ParticleSetDecoder(nn.Module):
             return slots, references, reference_mask, scale_anchors, scale_anchor_mask, (seed_index, is_anchor)
         return slots, references, reference_mask, scale_anchors, scale_anchor_mask
 
-    def _predict(self, slots, references=None, scale_anchors=None, scale_anchor_mask=None, tracker_fit=None, tracker_summary=None):
+    def _readout_momentum(self, normalized_slots, pid, momentum, hit_energy, readout):
+        """Momentum with log pt and log energy from the assigned calorimeter energy on the readout slots."""
+        with torch.autocast(device_type=normalized_slots.device.type, enabled=False):
+            ecal, hcal = hit_energy[..., 0].float(), hit_energy[..., 1].float()
+            total = ecal + hcal
+            shape = torch.stack([torch.log1p(ecal), torch.log1p(hcal), hcal / total.clamp_min(1e-6)], dim=-1)
+            correction = self.energy_correction(torch.cat([normalized_slots.float(), shape], dim=-1)).squeeze(-1)
+            log_energy = torch.log(total + 1e-3) + correction
+            # mass = P(neutral hadron) x m_nh; m_eff = m tanh(E / m) < E keeps p real and smooth
+            mass = torch.softmax(pid[..., 1:].float(), dim=-1)[..., 1] * 0.7 * self.readout_log_mass.float().exp()
+            energy = log_energy.exp()
+            m_eff = mass * torch.tanh(energy / mass.clamp_min(1e-6))
+            momentum = momentum.float()
+            log_p = log_energy + 0.5 * torch.log1p(-(m_eff / energy).square().clamp_max(1.0 - 1e-6))
+            log_pt = log_p - torch.log(torch.cosh(momentum[..., 1].clamp(-10.0, 10.0)))
+            return torch.cat(
+                [
+                    torch.where(readout, log_pt, momentum[..., 0])[..., None],
+                    momentum[..., 1:4],
+                    torch.where(readout, log_energy, momentum[..., 4])[..., None],
+                ],
+                dim=-1,
+            )
+
+    def _predict(
+        self,
+        slots,
+        references=None,
+        scale_anchors=None,
+        scale_anchor_mask=None,
+        tracker_fit=None,
+        tracker_summary=None,
+        hit_energy=None,
+        readout=None,
+    ):
+        """hit_energy: optional [batch, slots, 2] assigned ECAL and HCAL energy, read by the readout slots ([batch, slots] bool)."""
         normalized_slots = self.output_norm(slots)
         presence = self.presence_head(normalized_slots)
         pid = self.pid_head(normalized_slots)
@@ -680,8 +765,19 @@ class ParticleSetDecoder(nn.Module):
             correction = self.tracker_momentum_head(tracker_summary)
             pt = momentum[..., 0].float() + charged.float() * correction
             momentum = torch.cat((pt[..., None], momentum[..., 1:].float()), -1)
+        if hit_energy is not None:
+            momentum = self._readout_momentum(normalized_slots, pid, momentum, hit_energy, readout)
         pileup = torch.zeros_like(presence)
         return presence, pid, momentum, pileup
+
+    def _late_grouping(self, slots, memory):
+        """Assignment keys from the final slots, in the format of hit_grouping_loss; nothing is pooled into the slots."""
+        hit_keys = F.normalize(self.hit_grouping_hit(memory).float(), dim=-1)
+        # a smooth bound keeps the logit scale in [1, 100]
+        scale = (math.log(ASSIGNMENT_SCALE) * torch.tanh(self.assignment_log_scale.float() / math.log(ASSIGNMENT_SCALE))).exp()
+        slot_keys = F.normalize(self.hit_grouping_slot(self.output_norm(slots)).float(), dim=-1) * scale
+        background = self.hit_grouping_background(memory).float()
+        return hit_keys, slot_keys, background
 
     def _group_hits(self, slots, memory, memory_mask, input_features):
         """Hard predicted membership, followed by linear-memory detector-wise pooling."""
@@ -790,7 +886,7 @@ class ParticleSetDecoder(nn.Module):
             )
             seed_index, is_anchor = seeding
             grouping = None
-            if self.hit_grouping:
+            if self.hit_grouping and not self.hit_grouping_late:
                 slots, grouping, tracker_geometry, tracker_summary = self._group_hits(slots, memory, memory_mask, input_features)
                 if tracker_geometry is not None:
                     log_pt, fit_valid = tracker_geometry
@@ -845,8 +941,16 @@ class ParticleSetDecoder(nn.Module):
                 phi = references[..., 1] + step_size * delta[..., 1]
                 references = torch.stack([eta, torch.atan2(torch.sin(phi), torch.cos(phi))], dim=-1)
             is_final_layer = layer_index == len(self.layers) - 1
+            hit_energy = readout = None
+            if is_final_layer and self.hit_grouping and self.hit_grouping_late:
+                grouping = self._late_grouping(slots, memory)
+                if self.hit_energy_readout:
+                    hit_energy = assigned_energy(grouping, memory_mask, input_features, self.hit_grouping_chunk_size)
+                    # every slot not seeded on a track reads its assigned energy
+                    seed_type = torch.gather(input_features[..., 0], 1, seed_index.clamp_min(0))
+                    readout = ~((seed_index >= 0) & (seed_type == 1))
             if self.use_auxiliary_losses or is_final_layer:
-                outputs.append(self._predict(slots, references, scale_anchors, scale_anchor_mask, tracker_fit, tracker_summary))
+                outputs.append(self._predict(slots, references, scale_anchors, scale_anchor_mask, tracker_fit, tracker_summary, hit_energy, readout))
 
         auxiliary_predictions = tuple(outputs[:-1]) if self.use_auxiliary_losses else ()
         return ParticleSetDecoderOutput(
@@ -856,4 +960,5 @@ class ParticleSetDecoder(nn.Module):
             tracker_group_fit_valid=tracker_fit_valid,
             seed_index=seed_index,
             is_anchor=is_anchor,
+            hit_energy=hit_energy,
         )
