@@ -1046,6 +1046,17 @@ class SetDecoderConfig(BaseModel):
     allow_unmatched_targets: bool = False
     # threads for the per-event Hungarian assignments
     matching_threads: int = Field(default=1, ge=1)
+    # every track gets a slot (raises if the tracks exceed the tracker slots), and a batch raises if an event's
+    # matchable targets exceed its seeded slots
+    strict_seeding: bool = False
+    # "fill_unseeded": the slots the element seeds leave go to energy anchors, the bins of a global eta x phi grid
+    # (anchor_eta_step from eta = 0, anchor_phi_bins from -pi, |eta| <= anchor_eta_max) ranked by the calorimeter energy
+    # within anchor_smoothing of their center
+    anchor_mode: Literal["none", "fill_unseeded"] = "none"
+    anchor_eta_step: float = Field(default=0.05, gt=0.0)
+    anchor_phi_bins: int = Field(default=128, gt=0)
+    anchor_eta_max: float = Field(default=4.5, gt=0.0)
+    anchor_smoothing: float = Field(default=0.1, ge=0.0)
     # presence loss: weighted mean over the slots, or the weighted sum over the number of slots
     presence_normalization: Literal["mean", "num_slots"] = "mean"
     matcher: SetMatcherConfig = Field(default_factory=SetMatcherConfig)
@@ -1078,6 +1089,8 @@ class SetDecoderConfig(BaseModel):
             raise ValueError("new association/readout cannot be combined with legacy tracker_group_readout")
         if self.tracker_fit_correction and not self.tracker_group_readout:
             raise ValueError("tracker_fit_correction requires tracker_group_readout")
+        if (self.strict_seeding or self.anchor_mode != "none") and self.query_init != SetQueryInit.INPUT_CONDITIONED:
+            raise ValueError("set decoder strict_seeding and anchor_mode require query_init='input-conditioned'")
         return self
 
 

@@ -197,6 +197,24 @@ def set_event_loss(
     return losses, matches
 
 
+def _seed_diagnostics(seed_index, is_anchor, batch, num_slots):
+    """Raise if an event has more matchable targets than seeded slots; mean seeded, unseeded and anchor slots per event."""
+    if seed_index is None:
+        raise ValueError("strict_seeding needs the decoder's seed_index (query_init='input-conditioned')")
+    seeded = ((seed_index >= 0) if is_anchor is None else (seed_index >= 0) | is_anchor).sum(dim=1)
+    num_targets = batch.target_mask.sum(dim=1)
+    short = num_targets.clamp_max(num_slots) > seeded
+    if short.any():
+        event_idx = int(short.nonzero()[0].item())
+        where = f" (event_id {int(batch.event_id[event_idx])})" if getattr(batch, "event_id", None) is not None else ""
+        n, k = int(num_targets[event_idx]), int(seeded[event_idx])
+        raise ValueError(f"Batch entry {event_idx}{where} has {n} targets but only {k} seeded slots of {num_slots}")
+    out = {"SeededSlots": seeded.float().mean(), "UnseededSlots": (num_slots - seeded).float().mean()}
+    if is_anchor is not None:
+        out["AnchorSlots"] = is_anchor.sum(dim=1).float().mean()
+    return out
+
+
 def set_mlpf_loss(
     targets,
     predictions,
@@ -225,14 +243,23 @@ def set_mlpf_loss(
     allow_unmatched_targets=False,
     matching_threads=1,
     presence_normalization="mean",
+    seed_index=None,
+    is_anchor=None,
+    strict_seeding=False,
 ):
     """Compute the set-prediction objective with the standard task names.
 
-    allow_unmatched_targets logs UnmatchedTargets (count) and UnmatchedTargetFraction.
+    allow_unmatched_targets logs UnmatchedTargets (count) and UnmatchedTargetFraction. strict_seeding raises if an
+    event's matchable targets exceed its seeded slots (seed_index >= 0 or is_anchor) and logs SeededSlots, UnseededSlots
+    and AnchorSlots (means per event).
     """
 
     if batch.target_mask is None:
         raise ValueError("Set prediction requires batch.ytarget_set and batch.target_mask")
+
+    seed_diagnostics = {}
+    if strict_seeding:
+        seed_diagnostics = _seed_diagnostics(seed_index, is_anchor, batch, predictions["cls_binary"].shape[1])
 
     matches = hungarian_match(
         targets, predictions, batch.target_mask, matcher_weights, allow_unmatched_targets=allow_unmatched_targets, num_threads=matching_threads
@@ -263,6 +290,7 @@ def set_mlpf_loss(
 
     if "Cardinality" in losses:
         loss_opt = loss_opt + losses["Cardinality"]
+    losses.update(seed_diagnostics)
     if allow_unmatched_targets:
         total = batch.target_mask.sum()
         unmatched = total - sum(len(slot_indices) for slot_indices, _ in matches)

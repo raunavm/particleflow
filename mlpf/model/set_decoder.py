@@ -7,6 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from mlpf.logger import _logger
 from mlpf.model.tracker_group_readout import SUMMARY_DIM, tracker_group_geometry
 from mlpf.model.tracker_momentum_readout import (
     TrackerMomentumReadout,
@@ -39,6 +40,9 @@ class ParticleSetDecoderOutput(Sequence[torch.Tensor]):
     auxiliary_predictions: tuple[PredictionTensors, ...] = ()
     hit_grouping: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     tracker_group_fit_valid: torch.Tensor | None = None
+    # input-conditioned queries: [batch, slots] element that seeded each slot (-1 = none), and the energy-anchor slots
+    seed_index: torch.Tensor | None = None
+    is_anchor: torch.Tensor | None = None
 
     @overload
     def __getitem__(self, index: int) -> torch.Tensor: ...
@@ -273,6 +277,7 @@ class ParticleSetDecoder(nn.Module):
     """Decode learned or detector-seeded queries into an unordered particle set."""
 
     AGGREGATE_FEATURE_DIM = 8
+    _anchor_shortfall_logged = False
 
     def __init__(self, embedding_dim, num_classes, config):
         super().__init__()
@@ -361,6 +366,17 @@ class ParticleSetDecoder(nn.Module):
         if self.tracker_momentum_readout:
             self.tracker_momentum_head = TrackerMomentumReadout(embedding_dim, config.tracker_momentum_max_log_correction)
 
+        self.strict_seeding = config.strict_seeding
+        self.anchor_mode = config.anchor_mode
+        self.anchor_eta_step = config.anchor_eta_step
+        self.anchor_phi_bins = config.anchor_phi_bins
+        self.anchor_eta_max = config.anchor_eta_max
+        self.anchor_smoothing = config.anchor_smoothing
+        self.anchor_embedding = None
+        if self.anchor_mode != "none":
+            self.anchor_embedding = nn.Parameter(torch.empty(embedding_dim))
+            nn.init.trunc_normal_(self.anchor_embedding, std=0.02)
+
     @staticmethod
     def _take_topk(scores, candidates, count):
         count = min(count, int(candidates.sum().item()))
@@ -368,6 +384,61 @@ class ParticleSetDecoder(nn.Module):
             return torch.empty(0, dtype=torch.long, device=scores.device)
         ranked = scores.masked_fill(~candidates, -torch.inf)
         return torch.topk(ranked, count, sorted=True).indices
+
+    def _energy_anchors(self, input_features, calorimeter):
+        """Centers (eta, phi) and scores of the candidate energy anchors of one event.
+
+        The candidates are the bins of a global eta x phi grid (anchor_eta_step from eta = 0, anchor_phi_bins from -pi)
+        with |eta| <= anchor_eta_max. A bin's score is the calorimeter energy (column 5) within an L-inf distance
+        anchor_smoothing of its center.
+        """
+        device = input_features.device
+        step, num_phi = self.anchor_eta_step, self.anchor_phi_bins
+        phi_width = 2.0 * math.pi / num_phi
+        half = math.ceil(self.anchor_eta_max / step)  # eta bins -half .. half - 1
+        radius = self.anchor_smoothing
+
+        features = input_features[calorimeter].float()
+        eta = torch.nan_to_num(features[:, 2], nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+        phi = torch.atan2(features[:, 3], features[:, 4])
+        energy = features[:, 5].clamp_min(0.0)
+        eta_bin = torch.floor(eta / step).long() + half
+        phi_bin = torch.floor((phi + math.pi) / phi_width).long().clamp(0, num_phi - 1)
+        score = torch.zeros(2 * half * num_phi, dtype=torch.float32, device=device)
+        for d_eta in range(-math.ceil(radius / step) - 1, math.ceil(radius / step) + 2):
+            target_eta = eta_bin + d_eta
+            near_eta = (target_eta >= 0) & (target_eta < 2 * half) & ((eta - (target_eta - half + 0.5) * step).abs() <= radius)
+            for d_phi in range(-math.ceil(radius / phi_width) - 1, math.ceil(radius / phi_width) + 2):
+                target_phi = torch.remainder(phi_bin + d_phi, num_phi)
+                near = near_eta & (_wrapped_delta_phi(phi, -math.pi + (target_phi + 0.5) * phi_width).abs() <= radius)
+                score.index_add_(0, (target_eta * num_phi + target_phi)[near], energy[near])
+
+        center_eta = ((torch.arange(2 * half, device=device) - half + 0.5) * step).repeat_interleave(num_phi)
+        center_phi = (-math.pi + (torch.arange(num_phi, device=device) + 0.5) * phi_width).repeat(2 * half)
+        keep = center_eta.abs() <= self.anchor_eta_max
+        return center_eta[keep].float(), center_phi[keep].float(), score[keep]
+
+    @staticmethod
+    def _rank_anchors(score, count):
+        """The first count candidates by score, ties by bin order."""
+        return torch.sort(-score, stable=True).indices[:count]
+
+    def _seed_anchors(self, slots, references, reference_mask, is_anchor, event_idx, input_features, calorimeter, first):
+        """Fill the slots from first on with energy anchors: anchor embedding plus the position of the bin center."""
+        free = self.num_slots - first
+        anchor_eta, anchor_phi, anchor_energy = self._energy_anchors(input_features, calorimeter)
+        if free > len(anchor_energy) and not ParticleSetDecoder._anchor_shortfall_logged:
+            ParticleSetDecoder._anchor_shortfall_logged = True
+            _logger.warning(f"{free} free slots but {len(anchor_energy)} anchor bins: {free - len(anchor_energy)} stay unseeded (logged once)")
+        order = self._rank_anchors(anchor_energy, free)
+        anchor_slots = slice(first, first + len(order))
+        reference = torch.stack([anchor_eta[order], anchor_phi[order]], dim=-1)
+        position = torch.stack([reference[:, 0], torch.sin(reference[:, 1]), torch.cos(reference[:, 1])], dim=-1)
+        content = self.anchor_embedding.to(slots.dtype) + self.reference_embedding(position).to(slots.dtype)
+        slots[event_idx, anchor_slots] = slots[event_idx, anchor_slots] + content
+        references[event_idx, anchor_slots] = reference
+        reference_mask[event_idx, anchor_slots] = True
+        is_anchor[event_idx, anchor_slots] = True
 
     @staticmethod
     def _angular_grid_summary(input_features, valid, grid_size):
@@ -454,7 +525,7 @@ class ParticleSetDecoder(nn.Module):
         representative[valid_indices[representative_position]] = True
         return summaries, cell_rank, representative
 
-    def _input_conditioned_queries(self, memory, memory_mask, input_features):
+    def _input_conditioned_queries(self, memory, memory_mask, input_features, return_seeding=False):
         if input_features is None or input_features.shape[-1] < 6:
             raise ValueError("Input-conditioned set queries require raw input features through energy")
         if (self.proposal_mode == "grid-diverse" or self.use_aggregate_anchors) and input_features.shape[-1] < 9:
@@ -466,6 +537,8 @@ class ParticleSetDecoder(nn.Module):
         reference_mask = torch.zeros((batch_size, self.num_slots), dtype=torch.bool, device=memory.device)
         scale_anchors = memory.new_zeros((batch_size, self.num_slots, 2), dtype=torch.float32)
         scale_anchor_mask = torch.zeros((batch_size, self.num_slots), dtype=torch.bool, device=memory.device)
+        seed_index = torch.full((batch_size, self.num_slots), -1, dtype=torch.long, device=memory.device)
+        is_anchor = torch.zeros((batch_size, self.num_slots), dtype=torch.bool, device=memory.device)
         num_tracker_slots = round(self.num_slots * self.tracker_query_fraction)
 
         element_type = input_features[..., 0]
@@ -488,7 +561,14 @@ class ParticleSetDecoder(nn.Module):
                     input_features[event_idx], valid, self.proposal_grid_size
                 )
 
-            tracker_indices = self._take_topk(proposal_scores, tracker & proposal_candidates, num_tracker_slots)
+            tracker_candidates = tracker & proposal_candidates
+            if self.strict_seeding:
+                # every track gets a slot
+                tracker_candidates = tracker
+                num_tracks = int(tracker.sum().item())
+                if num_tracks > num_tracker_slots:
+                    raise ValueError(f"Event {event_idx} has {num_tracks} tracks but only {num_tracker_slots} tracker slots")
+            tracker_indices = self._take_topk(proposal_scores, tracker_candidates, num_tracker_slots)
             chosen_mask[tracker_indices] = True
             calo_slots = self.num_slots - len(tracker_indices)
             calo_indices = self._take_topk(proposal_scores, calorimeter & proposal_candidates & ~chosen_mask, calo_slots)
@@ -506,8 +586,11 @@ class ParticleSetDecoder(nn.Module):
                 selected = torch.cat([selected, fallback])
 
             num_selected = len(selected)
+            if self.anchor_mode == "fill_unseeded" and num_selected < self.num_slots:
+                self._seed_anchors(slots, references, reference_mask, is_anchor, event_idx, input_features[event_idx], calorimeter, num_selected)
             if num_selected == 0:
                 continue
+            seed_index[event_idx, :num_selected] = selected
             selected_eta = input_eta[event_idx, selected]
             selected_phi = input_phi[event_idx, selected]
             selected_summary = None
@@ -545,6 +628,11 @@ class ParticleSetDecoder(nn.Module):
                 slots[event_idx, :num_selected] = slots[event_idx, :num_selected] + self.aggregate_projection(selected_summary.to(memory.dtype))
             references[event_idx, :num_selected] = reference
             reference_mask[event_idx, :num_selected] = True
+        if self.anchor_embedding is not None:
+            # keeps the anchor embedding in the graph when no slot is an anchor, as DDP requires
+            slots = slots + 0.0 * self.anchor_embedding.sum().to(slots.dtype)
+        if return_seeding:
+            return slots, references, reference_mask, scale_anchors, scale_anchor_mask, (seed_index, is_anchor)
         return slots, references, reference_mask, scale_anchors, scale_anchor_mask
 
     def _predict(self, slots, references=None, scale_anchors=None, scale_anchor_mask=None, tracker_fit=None, tracker_summary=None):
@@ -695,8 +783,12 @@ class ParticleSetDecoder(nn.Module):
         tracker_fit_valid = None
         tracker_fit = None
         tracker_summary = None
+        seed_index = is_anchor = None
         if self.query_init == "input-conditioned":
-            slots, references, reference_mask, scale_anchors, scale_anchor_mask = self._input_conditioned_queries(memory, memory_mask, input_features)
+            slots, references, reference_mask, scale_anchors, scale_anchor_mask, seeding = self._input_conditioned_queries(
+                memory, memory_mask, input_features, return_seeding=True
+            )
+            seed_index, is_anchor = seeding
             grouping = None
             if self.hit_grouping:
                 slots, grouping, tracker_geometry, tracker_summary = self._group_hits(slots, memory, memory_mask, input_features)
@@ -762,4 +854,6 @@ class ParticleSetDecoder(nn.Module):
             auxiliary_predictions=auxiliary_predictions,
             hit_grouping=grouping,
             tracker_group_fit_valid=tracker_fit_valid,
+            seed_index=seed_index,
+            is_anchor=is_anchor,
         )
