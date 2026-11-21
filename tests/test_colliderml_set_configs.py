@@ -10,7 +10,12 @@ from mlpf.model.training import model_step
 from test_colliderml_crops import make_record
 
 SPEC = str(Path(__file__).resolve().parents[1] / "particleflow_spec.yaml")
-CONFIGS = ["pyg-colliderml-pu0-v20-set-hits", "pyg-colliderml-pu0-v20-set-hits-seedmax-dice", "pyg-colliderml-pu200-v22-set-hits-crops"]
+CONFIGS = [
+    "pyg-colliderml-pu0-v20-set-hits",
+    "pyg-colliderml-pu0-v20-set-hits-seedmax-dice",
+    "pyg-colliderml-pu0-v20-set-hits-seedmax-dice-entry",
+    "pyg-colliderml-pu200-v22-set-hits-crops",
+]
 
 
 @pytest.mark.parametrize("name", CONFIGS)
@@ -27,6 +32,7 @@ def test_set_configs_build_and_take_a_cpu_step(name):
         assert batch_size == 8
     decoder = config.model.set_decoder
     assert (decoder.calo_seed_local_max_radius is not None) == ("seedmax" in name)
+    assert config.model.colliderml_track_entry_features == name.endswith("entry")
     MLPF(config)
 
     # flash attention has no CPU backend: the smoke runs the same model on math attention

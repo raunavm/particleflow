@@ -1684,6 +1684,16 @@ models:
         calo_seed_local_max_radius: 0.02
         hit_grouping_dice_loss_weight: 2.0
 
+  pyg-colliderml-pu0-v20-set-hits-seedmax-dice-entry:
+    <<: *pyg_colliderml_pu0_v20_set_hits
+    architecture:
+      <<: *pyg_colliderml_v20_set_hits_architecture
+      colliderml_track_entry_features: true
+      set_decoder:
+        <<: *v20_set_hits_decoder
+        calo_seed_local_max_radius: 0.02
+        hit_grouping_dice_loss_weight: 2.0
+
   # The same model on the PU200 v22 blocks, trained on (eta, phi) crops of each event with host-class targets.
   pyg-colliderml-pu200-v22-set-hits-crops:
     <<: *pyg_colliderml_pu0_v20_set_hits
